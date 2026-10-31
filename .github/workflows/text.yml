@@ -1,0 +1,545 @@
+name: Build Kernel Whyred (LunarKnight + KSU-Next legacy-susfs + NoMount)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Repo source kernel (owner/nama)"
+        type: string
+        default: "IndraSenzZ/LunarKnight"
+      kernel_ref:
+        description: "Branch / tag / commit source kernel"
+        type: string
+        default: "back"
+      defconfig:
+        description: "Defconfig (kosong = auto-detect *whyred* di arch/arm64/configs)"
+        type: string
+        default: ""
+      release:
+        description: "Upload zip ke GitHub Release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build whyred
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      KERNEL_REPO: ${{ inputs.kernel_repo }}
+      KERNEL_REF: ${{ inputs.kernel_ref }}
+      DEFCONFIG_IN: ${{ inputs.defconfig }}
+      KSUN_REPO: "Youffx/KernelSU-Next"
+      KSUN_REF: "legacy-susfs"
+      NOMOUNT_REF: "latest"
+      LINKER: "lld"
+      KBUILD_BUILD_USER: "Shirakumo"
+      KBUILD_BUILD_HOST: "Github"
+      LC_ALL: C
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      # ------------------------------------------------------------------ source
+      - name: Checkout source kernel
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ inputs.kernel_ref }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Siapkan environment & dependency
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl flex git \
+            libelf-dev libssl-dev lz4 patchelf python3 python-is-python3 xz-utils zip unzip zstd \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+          git config --global --add safe.directory '*'
+          {
+            echo "KSRC=$GITHUB_WORKSPACE/kernel"
+            echo "KCF=-Wno-unknown-warning-option -Wno-implicit-function-declaration -Wno-implicit-int -Wno-int-conversion -Wno-incompatible-function-pointer-types -Wno-deprecated-non-prototype -Wno-strict-prototypes -Wno-unused-but-set-variable -Wno-array-bounds -Wno-unused-variable -Wno-unused-function"
+          } >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------- toolchain
+      - name: Pasang Neutron Clang
+        run: |
+          mkdir -p "$HOME/neutron"
+          cd "$HOME/neutron"
+          curl -fsSL https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman -o antman
+          chmod +x antman
+          if ! ./antman -S || [ ! -x bin/clang ]; then
+            echo "::warning::antman gagal, fallback ke release clang-build-catalogue"
+            URL=$(gh api repos/Neutron-Toolchains/clang-build-catalogue/releases/latest \
+                  --jq '[.assets[] | select(.name | endswith(".tar.zst"))][0].browser_download_url')
+            [ -n "$URL" ] || { echo "::error::tidak menemukan asset Neutron Clang"; exit 1; }
+            curl -fsSL "$URL" | tar --zstd -x
+          fi
+          [ -x bin/clang ] || { echo "::error::Neutron Clang tidak terpasang"; exit 1; }
+          export PATH="$HOME/neutron/bin:$PATH"
+          if ! clang --version >/dev/null 2>&1; then
+            echo "::warning::clang tidak bisa jalan, mencoba antman --patch=glibc"
+            ./antman --patch=glibc
+          fi
+          clang --version | sed -n '1p'
+          ld.lld --version | sed -n '1p'
+          command -v aarch64-linux-gnu-elfedit arm-linux-gnueabi-ld
+          echo "$HOME/neutron/bin" >> "$GITHUB_PATH"
+
+      - name: Buat helper build (kmake.sh)
+        run: |
+          cat > "$GITHUB_WORKSPACE/kmake.sh" <<'EOF'
+          #!/usr/bin/env bash
+          cd "$KSRC" || exit 1
+          LDARG=()
+          [ "${LINKER:-lld}" = "lld" ] && LDARG=(LD=ld.lld)
+          exec make O=out ARCH=arm64 SUBARCH=arm64 \
+            CC=clang HOSTCC=clang HOSTCXX=clang++ "${LDARG[@]}" \
+            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            READELF=llvm-readelf STRIP=llvm-strip \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            KCFLAGS="$KCF" \
+            "$@"
+          EOF
+          chmod +x "$GITHUB_WORKSPACE/kmake.sh"
+
+      - name: Deteksi versi kernel & defconfig
+        run: |
+          cd "$KSRC"
+          KVER=$(make -s kernelversion)
+          SHA=$(git rev-parse --short HEAD)
+          echo "[i] Kernel $KVER @ $SHA"
+          if [ -n "$DEFCONFIG_IN" ]; then
+            DEF="$DEFCONFIG_IN"
+          else
+            DEF=""
+            for c in whyred_defconfig vendor/whyred_defconfig whyred-perf_defconfig vendor/whyred-perf_defconfig; do
+              if [ -f "arch/arm64/configs/$c" ]; then DEF="$c"; break; fi
+            done
+            if [ -z "$DEF" ]; then
+              DEF=$(cd arch/arm64/configs && find . -type f -name '*whyred*' | sed 's|^\./||' | sort | sed -n '1p')
+            fi
+          fi
+          if [ -z "$DEF" ] || [ ! -f "arch/arm64/configs/$DEF" ]; then
+            echo "::error::defconfig whyred tidak ditemukan. Isi input 'defconfig'. Daftar config:"
+            find arch/arm64/configs -type f | sort | sed -n '1,80p'
+            exit 1
+          fi
+          echo "[i] Defconfig: $DEF"
+          {
+            echo "KVER=$KVER"
+            echo "KSHA=$SHA"
+            echo "DEF=$DEF"
+          } >> "$GITHUB_ENV"
+
+      # --------------------------------------------------------- KernelSU-Next
+      - name: Integrasi KernelSU-Next legacy-susfs (setup.sh resmi)
+        run: |
+          cd "$KSRC"
+          curl -LSs "https://raw.githubusercontent.com/${KSUN_REPO}/${KSUN_REF}/kernel/setup.sh" | bash -s "$KSUN_REF"
+          # Verifikasi minimal
+          [ -d KernelSU-Next/.git ] || { echo "::error::KernelSU-Next gagal di-clone"; exit 1; }
+          [ -L drivers/kernelsu ] || { echo "::error::symlink drivers/kernelsu tidak ada"; exit 1; }
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || { echo "::error::Kconfig KSU tidak terdaftar"; exit 1; }
+          echo "[OK] KernelSU-Next terintegrasi"
+
+      - name: Manual hooks KernelSU-Next (patch resmi untuk 4.19)
+        run: |
+          cd "$KSRC"
+          # Terapkan patch dari dokumentasi resmi
+          python3 - <<'PYEOF'
+          import re, sys
+          from pathlib import Path
+
+          def patch_file(path, patterns):
+              p = Path(path)
+              if not p.exists():
+                  print(f"::error::{path} tidak ditemukan"); sys.exit(1)
+              text = p.read_text()
+              for old, new in patterns:
+                  if old not in text:
+                      print(f"::error::Anchor tidak ditemukan di {path}: {old[:60]}..."); sys.exit(1)
+                  text = text.replace(old, new, 1)
+              p.write_text(text)
+              print(f"[+] {path} dipatch")
+
+          # 1. fs/exec.c – do_execve & compat_do_execve
+          patch_file("fs/exec.c", [
+              ("int do_execve(struct filename *filename,",
+               "#ifdef CONFIG_KSU\n__attribute__((hot))\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n                                void *argv, void *envp, int *flags);\n#endif\nint do_execve(struct filename *filename,"),
+              ("\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);",
+               "#ifdef CONFIG_KSU\n\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n#endif\n\treturn do_execveat_common(AT_FDCWD, filename, argv, envp, 0);")
+          ])
+
+          # 2. fs/open.c – faccessat
+          patch_file("fs/open.c", [
+              ("SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
+               "#ifdef CONFIG_KSU\n__attribute__((hot))\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n                                int *mode, int *flags);\n#endif\nSYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)"),
+              ("\tif (mode & ~S_IRWXO)",
+               "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n\tif (mode & ~S_IRWXO)")
+          ])
+
+          # 3. fs/read_write.c – read
+          patch_file("fs/read_write.c", [
+              ("SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)",
+               "#ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\nextern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd,\n                                                     char __user **buf_ptr, size_t *count_ptr);\n#endif\nSYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)"),
+              ("\tif (f.file) {",
+               "#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_sys_read(fd, &buf, &count);\n#endif\n\tif (f.file) {")
+          ])
+
+          # 4. fs/stat.c – newfstatat & fstatat64
+          patch_file("fs/stat.c", [
+              ("SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,",
+               "#ifdef CONFIG_KSU\n__attribute__((hot))\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\nSYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,"),
+              ("\terror = vfs_fstatat(dfd, filename, &stat, flag);",
+               "#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif\n\terror = vfs_fstatat(dfd, filename, &stat, flag);")
+          ])
+          # fstatat64 (jika ada)
+          try:
+              patch_file("fs/stat.c", [
+                  ("SYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,",
+                   "#ifdef CONFIG_KSU\n__attribute__((hot))\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\nSYSCALL_DEFINE4(fstatat64, int, dfd, const char __user *, filename,"),
+                  ("\terror = vfs_fstatat(dfd, filename, &stat, flag);",
+                   "#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flag);\n#endif\n\terror = vfs_fstatat(dfd, filename, &stat, flag);")
+              ])
+          except SystemExit:
+              print("[i] fstatat64 tidak ditemukan, dilewati")
+
+          # 5. kernel/reboot.c – reboot
+          patch_file("kernel/reboot.c", [
+              ("SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,",
+               "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\nSYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,"),
+              ("\tif (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))",
+               "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n\tif (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))")
+          ])
+
+          print("[OK] Semua manual hook resmi terpasang")
+          PYEOF
+          # Verifikasi cepat
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/reboot.c; do
+            grep -q 'CONFIG_KSU' "$f" || { echo "::error::$f tidak memuat hook KSU"; exit 1; }
+          done
+          echo "[OK] Verifikasi hook selesai"
+
+      # ------------------------------------------------------------ NoMount
+      - name: Integrasi NoMount (built-in)
+        run: |
+          cd "$KSRC"
+          REF="$NOMOUNT_REF"
+          if [ "$REF" = "latest" ]; then
+            REF=$(gh api repos/maxsteeel/nomount/releases/latest --jq .tag_name 2>/dev/null || echo "master")
+          fi
+          echo "[i] NoMount ref: $REF"
+          echo "NOMOUNT_REF=$REF" >> "$GITHUB_ENV"
+          curl -fsSL "https://raw.githubusercontent.com/maxsteeel/nomount/${REF}/kernel/setup.sh" | bash -s "$REF"
+          # Verifikasi
+          [ -f fs/nomount/Kconfig ] || { echo "::error::NoMount Kconfig tidak ada"; exit 1; }
+          grep -q 'nomount/Kconfig' fs/Kconfig || { echo "::error::NoMount tidak terdaftar di fs/Kconfig"; exit 1; }
+          grep -q 'nomount/' fs/Makefile || { echo "::error::NoMount tidak terdaftar di fs/Makefile"; exit 1; }
+          echo "[OK] NoMount terintegrasi"
+
+      # ------------------------------------------------------------- path_umount backport
+      - name: Backport path_umount (kernel 4.19)
+        run: |
+          cd "$KSRC"
+          python3 - <<'PYEOF'
+          import re, sys
+          from pathlib import Path
+
+          ns_path = Path("fs/namespace.c")
+          if not ns_path.exists():
+              print("::error::fs/namespace.c tidak ditemukan"); sys.exit(1)
+          text = ns_path.read_text()
+
+          # Cek apakah path_umount sudah ada
+          if re.search(r"(?m)^[ \t]*(?:static[ \t]+)?int[ \t]+path_umount[ \t]*\([^;{}]*\)[ \t\r\n]*\{", text):
+              print("[i] path_umount sudah ada")
+              sys.exit(0)
+
+          # Sisipkan implementasi minimal sebelum is_mnt_ns_file
+          anchor = re.search(r"(?m)^static bool is_mnt_ns_file\s*\(", text)
+          if not anchor:
+              print("::error::anchor is_mnt_ns_file tidak ditemukan"); sys.exit(1)
+
+          impl = r'''
+static int can_umount(const struct path *path, int flags)
+{
+    struct mount *mnt = real_mount(path->mnt);
+
+    if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+        return -EINVAL;
+    if (!may_mount())
+        return -EPERM;
+    if (path->dentry != path->mnt->mnt_root)
+        return -EINVAL;
+    if (!check_mnt(mnt))
+        return -EINVAL;
+    if (mnt->mnt.mnt_flags & MNT_LOCKED)
+        return -EINVAL;
+    if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+        return -EPERM;
+    return 0;
+}
+
+int path_umount(struct path *path, int flags)
+{
+    struct mount *mnt = real_mount(path->mnt);
+    int ret;
+
+    ret = can_umount(path, flags);
+    if (!ret)
+        ret = do_umount(mnt, flags);
+
+    dput(path->dentry);
+    mntput_no_expire(mnt);
+    return ret;
+}
+'''
+          text = text[:anchor.start()] + impl + "\n" + text[anchor.start():]
+          ns_path.write_text(text)
+          print("[+] path_umount ditambahkan ke fs/namespace.c")
+
+          # Tambahkan prototype ke fs/internal.h
+          ih = Path("fs/internal.h")
+          if ih.exists():
+              htext = ih.read_text()
+              proto = "int path_umount(struct path *path, int flags);"
+              if proto not in htext:
+                  # Sisipkan setelah deklarasi mnt_init atau di akhir
+                  anchor_h = re.search(r"(?m)^extern void __init mnt_init\(void\);", htext)
+                  if anchor_h:
+                      htext = htext[:anchor_h.end()] + "\n" + proto + htext[anchor_h.end():]
+                  else:
+                      htext += "\n" + proto + "\n"
+                  ih.write_text(htext)
+                  print("[+] prototype path_umount ditambahkan ke fs/internal.h")
+          PYEOF
+
+      # ------------------------------------------------------------------- konfigurasi
+      - name: Konfigurasi kernel
+        run: |
+          export PATH="$HOME/neutron/bin:$PATH"
+          cd "$KSRC"
+          rm -rf out
+          "$GITHUB_WORKSPACE/kmake.sh" "$DEF"
+
+          CFG=out/.config
+          sc() { scripts/config --file "$CFG" "$@"; }
+
+          # Kernel name & author
+          sc --set-str LOCALVERSION "-st20-LunarKnight"
+          sc -d LOCALVERSION_AUTO
+
+          # KernelSU-Next
+          sc -e KSU
+          sc -e KSU_MANUAL_HOOK
+          sc -d KSU_KPROBE_HOOKS
+          sc -d KSU_DEBUG
+
+          # SUSFS (sudah built-in di legacy-susfs)
+          sc -e KSU_SUSFS
+          sc -e KSU_SUSFS_SUS_MOUNT
+          sc -e KSU_SUSFS_SUS_KSTAT
+          sc -e KSU_SUSFS_SPOOF_UNAME
+          sc -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          sc -e KSU_SUSFS_OPEN_REDIRECT
+          sc -e KSU_SUSFS_SUS_MAP
+
+          # NoMount & pendukung
+          sc -e NOMOUNT
+          sc -e KEYS
+          sc -e OVERLAY_FS
+          sc -e TMPFS_XATTR
+          sc -e TMPFS_POSIX_ACL
+
+          # Zygisk / Kallsyms
+          sc -e KALLSYMS
+          sc -e KALLSYMS_ALL
+
+          # pastikan COMPAT_VDSO mati jika tidak ada gcc arm32
+          if grep -qx 'CONFIG_COMPAT_VDSO=y' "$CFG" && ! command -v arm-linux-gnueabi-gcc >/dev/null 2>&1; then
+            sc -d COMPAT_VDSO
+          fi
+
+          "$GITHUB_WORKSPACE/kmake.sh" olddefconfig
+
+          # Verifikasi config wajib
+          fail=0
+          need() {
+            if ! grep -qx "$1" "$CFG"; then
+              echo "::error::$CFG tidak memuat $1"
+              fail=1
+            fi
+          }
+          need CONFIG_KSU=y
+          need CONFIG_KSU_MANUAL_HOOK=y
+          need CONFIG_NOMOUNT=y
+          need CONFIG_KEYS=y
+          need CONFIG_OVERLAY_FS=y
+          need CONFIG_KALLSYMS_ALL=y
+          need CONFIG_KSU_SUSFS=y
+          if grep -E '^CONFIG_KSU_[A-Z0-9_]*KPROBE[A-Z0-9_]*=y' "$CFG"; then
+            echo "::error::Kprobe hook masih aktif"
+            fail=1
+          fi
+          [ "$fail" = 0 ] || exit 1
+          echo "----- ringkasan config -----"
+          grep -E '^(# )?CONFIG_(KSU|NOMOUNT|KEYS|OVERLAY_FS|KALLSYMS|LOCALVERSION)' "$CFG" || true
+
+      - name: Relax -Werror bawaan vendor
+        run: |
+          cd "$KSRC"
+          n=0
+          while IFS= read -r f; do
+            if grep -qE '(^|[[:space:]])-Werror([[:space:]]|$)' "$f"; then
+              sed -E -i 's/(^|[[:space:]])-Werror([[:space:]]|$)/\1\2/g' "$f"
+              n=$((n+1))
+            fi
+          done < <(find drivers techpack fs net sound security kernel mm lib block crypto arch/arm64 KernelSU-Next/kernel \
+                     -type f \( -name Makefile -o -name Kbuild -o -name 'Makefile.*' \) 2>/dev/null)
+          echo "[i] -Werror dihapus dari $n Makefile"
+
+      # ------------------------------------------------------------------------ build
+      - name: Build kernel
+        run: |
+          export PATH="$HOME/neutron/bin:$PATH"
+          cd "$KSRC"
+          set +e
+          "$GITHUB_WORKSPACE/kmake.sh" -j"$(nproc)" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Build gagal (rc=$rc)"
+            grep -nE 'error:|Error [0-9]+|undefined reference|ld(\.lld)?: error' "$GITHUB_WORKSPACE/build.log" | sed -n '1,60p' || true
+            exit 1
+          fi
+          ls -la out/arch/arm64/boot
+
+      - name: Verifikasi hasil build
+        run: |
+          export PATH="$HOME/neutron/bin:$PATH"
+          cd "$KSRC"
+          llvm-nm out/vmlinux > "$RUNNER_TEMP/syms.txt"
+          fail=0
+          for s in ksu_handle_execveat ksu_handle_faccessat ksu_handle_stat ksu_handle_sys_reboot path_umount; do
+            grep -qw "$s" "$RUNNER_TEMP/syms.txt" || { echo "::error::simbol $s tidak ada di vmlinux"; fail=1; }
+          done
+          find out/drivers/kernelsu -name '*.o' 2>/dev/null | grep -q . || { echo "::error::objek KernelSU tidak terkompilasi"; fail=1; }
+          find out/fs/nomount -name '*.o' 2>/dev/null | grep -q . || { echo "::error::objek NoMount tidak terkompilasi"; fail=1; }
+          grep -qi 'nomount' "$RUNNER_TEMP/syms.txt" || { echo "::error::simbol NoMount tidak ada di vmlinux"; fail=1; }
+          if grep -qx 'CONFIG_KSU_SUSFS=y' out/.config; then
+            grep -qi 'susfs' "$RUNNER_TEMP/syms.txt" || { echo "::error::KSU_SUSFS=y tapi simbol susfs tidak ada"; fail=1; }
+          fi
+          [ "$fail" = 0 ] || exit 1
+          echo "[OK] KernelSU-Next + SUSFS + NoMount ter-link di vmlinux"
+          grep -E ' (ksu_handle_|ksu_vfs_read_hook)' "$RUNNER_TEMP/syms.txt" || true
+
+      # --------------------------------------------------------------------- packaging
+      - name: Package AnyKernel3
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          cd AnyKernel3
+          rm -rf .git .github README.md
+
+          cat > anykernel.sh <<'EOF'
+          #!/sbin/sh
+          # AnyKernel3 - LunarKnight / Xiaomi Redmi Note 5 Pro (whyred)
+          properties() { '
+          kernel.string=LunarKnight 4.19.325-st20 - KernelSU-Next legacy-susfs (manual hooks) + NoMount
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=whyred
+          '; } # end properties
+
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          ui_print " ";
+          ui_print "LunarKnight 4.19.325-st20 (whyred)";
+          ui_print "KernelSU-Next legacy-susfs + NoMount";
+
+          split_boot;
+          flash_boot;
+          EOF
+
+          BOOT="$KSRC/out/arch/arm64/boot"
+          if [ -f "$BOOT/Image.gz-dtb" ]; then
+            cp "$BOOT/Image.gz-dtb" Image.gz-dtb
+          elif [ -f "$BOOT/Image.gz" ]; then
+            echo "::warning::Image.gz-dtb tidak ada, merakit Image.gz + dtb"
+            mapfile -t DTBS < <(find "$BOOT/dts" -name '*whyred*.dtb' | sort)
+            [ "${#DTBS[@]}" -gt 0 ] || mapfile -t DTBS < <(find "$BOOT/dts" -name '*sdm636*.dtb' | sort)
+            [ "${#DTBS[@]}" -gt 0 ] || { echo "::error::DTB whyred tidak ditemukan"; exit 1; }
+            cat "$BOOT/Image.gz" "${DTBS[@]}" > Image.gz-dtb
+          else
+            echo "::error::tidak ada Image.gz-dtb / Image.gz di $BOOT"; ls -la "$BOOT"; exit 1
+          fi
+          SZ=$(stat -c %s Image.gz-dtb)
+          echo "[i] Image.gz-dtb = $SZ bytes"
+          [ "$SZ" -gt 4000000 ] || { echo "::error::Image.gz-dtb terlalu kecil"; exit 1; }
+
+          STAMP=$(TZ=Asia/Jakarta date +%Y%m%d-%H%M)
+          ZIP="LunarKnight-whyred-${KVER}-st20-${STAMP}-${KSHA}.zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP" . -x '*.git*' > /dev/null
+          {
+            echo "ZIP=$ZIP"
+            echo "STAMP=$STAMP"
+          } >> "$GITHUB_ENV"
+          cp "$KSRC/out/.config" "$GITHUB_WORKSPACE/kernel.config"
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: LunarKnight-whyred-${{ env.STAMP }}
+          path: ${{ github.workspace }}/${{ env.ZIP }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload log & config
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log-${{ github.run_number }}
+          path: |
+            ${{ github.workspace }}/build.log
+            ${{ github.workspace }}/kernel.config
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Ringkasan
+        if: success()
+        run: |
+          {
+            echo "### LunarKnight whyred ${KVER}-st20"
+            echo "- Kernel: \`${KERNEL_REPO}@${KERNEL_REF}\` (${KSHA})"
+            echo "- KernelSU-Next: \`${KSUN_REPO}@${KSUN_REF}\` (manual hooks, SUSFS built-in)"
+            echo "- NoMount: \`${NOMOUNT_REF}\` (built-in)"
+            echo "- Zip: \`${ZIP}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Release (opsional)
+        if: ${{ inputs.release }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          gh release create "whyred-${STAMP}" "$ZIP" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "LunarKnight whyred ${KVER}-st20 (${STAMP})" \
+            --notes "Kernel ${KVER}-st20 @ ${KSHA} | KernelSU-Next ${KSUN_REPO}@${KSUN_REF} (manual hooks, SUSFS built-in) | NoMount ${NOMOUNT_REF} (built-in) | Neutron Clang"
