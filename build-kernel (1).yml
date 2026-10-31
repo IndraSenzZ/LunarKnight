@@ -1,37 +1,11 @@
-name: Build Kernel Whyred (LunarKnight + SukiSU Ultra builtin + SUSFS + KPM + NoMount)
+name: Build Kernel Whyred (LunarKnight + KSU-Next legacy-susfs + NoMount)
 
-# Taruh di .github/workflows/build-kernel.yml, lalu Actions -> Run workflow.
+# Taruh di .github/workflows/ lalu Actions -> "Build Kernel Whyred ..." -> Run workflow.
 #
-# SukiSU-Ultra (branch `builtin`, via setup.sh resmi) adalah SATU-SATUNYA sumber SUSFS + KPM di workflow ini.
-# Tidak ada patch SUSFS eksternal (susfs_patch_to_4.19.patch dkk. sudah dibuang). Sisa SUSFS lama di source
-# kernel dibersihkan, lalu opsi CONFIG_KSU_SUSFS* bawaan builtin diaktifkan. Karena Kbuild builtin mencetak
-# "You have not integrated susfs in your kernel yet" (cek fs/susfs.c), step probe driver memverifikasi dengan
-# llvm-nm bahwa fungsi susfs_* benar-benar didefinisikan oleh driver builtin; kalau tidak, build berhenti di
-# menit ke-1 dengan pesan yang jelas, bukan gagal link di menit ke-40.
-#
-# Signature hook: di SukiSU builtin, ksu_handle_faccessat/ksu_handle_stat varian CONFIG_KSU_SUSFS memakai
-# `struct filename **` (butuh caller getname_flags ala kernel >= 6.1). Hook panduan memakai `const char __user **`;
-# kalau dua-duanya tercampur di kernel 4.19, hasilnya UB / boot hang tanpa error compile. Skrip hook menormalkan
-# guard varian itu ke kernel >= 6.1 dan menolak lanjut kalau varian `const char __user **` tidak ada.
-#
-# Urutan (integrasi dulu, toolchain belakangan, supaya error integrasi muncul di menit ke-1, bukan ke-40):
-#   checkout LunarKnight -> penamaan kernel -> bersihkan sisa KSU/SUSFS lama -> SukiSU-Ultra builtin
-#   -> hook manual sesuai panduan sukisu.org/guide/how-to-integrate -> NoMount -> backport path_umount
-#   -> Neutron Clang -> config -> kompilasi driver KSU lebih dulu -> build -> verifikasi
-#   -> (opsional) patch KPM -> AnyKernel3.
-#
-# Perbaikan terbaru: drivers/kernelsu meng-include <generated/compile.h>, yang di kernel 4.19 baru dibuat oleh init/Makefile.
-# Kompilasi driver lebih dulu (dan build paralel) gagal "'generated/compile.h' file not found"; sekarang dibuat eksplisit
-# oleh gen_compile_h.sh sebelum driver dikompilasi.
-#
-# Perbaikan build-log-7: drivers/kernelsu/kernel_includes.h meng-include <linux/static_call.h> (infrastruktur
-# static_call baru ada di kernel 5.10; 4.19 tidak punya) -> "fatal error: 'linux/static_call.h' file not found".
-# Step Compat sekarang menyediakan shim generik (fallback function-pointer, semantik sama dengan implementasi
-# generic upstream) HANYA kalau kernel belum punya header itu. Probe driver juga memakai `make -k` supaya semua
-# error kompatibilitas driver muncul sekaligus dalam satu run (bukan satu error per run).
-#
-# Hook manual (branch builtin tidak memakai kprobes): execveat, faccessat, newfstatat,
-# newfstat-ret (wajib Android 16+), sys_reboot. Hook yang sudah ada di fungsi syscall itu tidak digandakan.
+# Alur: LunarKnight -> Neutron Clang -> KernelSU-Next legacy-susfs (commit ter-pin, SUSFS bawaan fork)
+#       -> manual hooks -> NoMount built-in -> path_umount -> config -> build -> verifikasi binary -> AnyKernel3.
+# Setiap tahap punya verifikasi keras: kalau ada yang tidak cocok, build berhenti di tahap itu
+# dengan pesan jelas (bukan gagal diam-diam di menit ke-40). Tidak ada fallback.
 
 on:
   workflow_dispatch:
@@ -48,35 +22,18 @@ on:
         description: "Defconfig (kosong = auto-detect *whyred* di arch/arm64/configs)"
         type: string
         default: ""
-      kernel_name:
-        description: "Kernel release string (uname -r)"
+      kernel_release:
+        description: "Nama kernel akhir (uname -r)"
         type: string
         default: "4.19.325-st20-LunarKnight"
-      ksu_ref:
-        description: "Branch SukiSU-Ultra. Default builtin (tanpa kprobes, hook manual; membawa SUSFS dan KPM)"
+      ksun_ref:
+        description: "Commit/branch Youffx/KernelSU-Next (legacy-susfs). Default = commit ter-pin"
         type: string
-        default: "builtin"
-      susfs:
-        description: "Aktifkan SUSFS bawaan SukiSU builtin (tanpa patch eksternal). false = baseline tanpa SUSFS"
-        type: boolean
-        default: true
+        default: "801101e"
       nomount_ref:
-        description: "Ref NoMount: 'latest' = release terbaru, atau tag/branch/commit"
+        description: "Ref NoMount: 'latest' = release terbaru (cocok dgn modul), atau tag/branch/commit"
         type: string
         default: "latest"
-      kpm:
-        description: "Aktifkan CONFIG_KPM (KernelPatch Module)"
-        type: boolean
-        default: true
-      kpm_patch:
-        description: "Patch Image dengan patch_linux (KernelPatch). Zip tanpa patch tetap dibuat sebagai cadangan"
-        type: boolean
-        default: true
-      linker:
-        description: "Linker kernel"
-        type: choice
-        options: [lld, gnu]
-        default: lld
       release:
         description: "Upload zip ke GitHub Release"
         type: boolean
@@ -93,18 +50,12 @@ jobs:
   build:
     name: Build whyred
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 120
     env:
-      KERNEL_REPO: ${{ inputs.kernel_repo }}
-      KERNEL_REF: ${{ inputs.kernel_ref }}
+      KERNEL_RELEASE: ${{ inputs.kernel_release }}
       DEFCONFIG_IN: ${{ inputs.defconfig }}
-      KNAME_IN: ${{ inputs.kernel_name }}
-      KSU_REF: ${{ inputs.ksu_ref }}
+      KSUN_REF: ${{ inputs.ksun_ref }}
       NOMOUNT_REF_IN: ${{ inputs.nomount_ref }}
-      SUSFS_ENABLE: ${{ inputs.susfs }}
-      KPM: ${{ inputs.kpm }}
-      KPM_PATCH: ${{ inputs.kpm_patch }}
-      LINKER: ${{ inputs.linker }}
       KBUILD_BUILD_USER: Shirakumo
       KBUILD_BUILD_HOST: Github
       LC_ALL: C
@@ -113,734 +64,539 @@ jobs:
     steps:
       # ------------------------------------------------------------------ source
       - name: Checkout source kernel
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
         with:
           repository: ${{ inputs.kernel_repo }}
           ref: ${{ inputs.kernel_ref }}
           path: kernel
           fetch-depth: 1
 
-      - name: Siapkan environment & dependency
+      - name: Siapkan dependency
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            bc bison build-essential ca-certificates cpio curl flex git \
-            libelf-dev libssl-dev lz4 patch patchelf python3 python-is-python3 xz-utils zip unzip zstd \
+            bc bison build-essential cpio curl flex git libelf-dev libssl-dev lz4 python3 unzip zip zstd \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
           git config --global --add safe.directory '*'
-          mkdir -p "$GITHUB_WORKSPACE/reports"
           {
             echo "KSRC=$GITHUB_WORKSPACE/kernel"
-            echo "KCF=-Wno-unknown-warning-option -Wno-implicit-function-declaration -Wno-implicit-int -Wno-int-conversion -Wno-incompatible-function-pointer-types -Wno-deprecated-non-prototype -Wno-strict-prototypes -Wno-unused-but-set-variable -Wno-array-bounds"
+            echo "KCF=-Wno-unknown-warning-option -Wno-implicit-function-declaration -Wno-implicit-int -Wno-int-conversion -Wno-incompatible-function-pointer-types -Wno-deprecated-non-prototype -Wno-strict-prototypes -Wno-unused-but-set-variable -Wno-array-bounds -Wno-unused-variable -Wno-unused-function"
           } >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------- toolchain
+      - name: Pasang Neutron Clang
+        run: |
+          mkdir -p "$HOME/neutron" && cd "$HOME/neutron"
+          curl -fsSL https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman -o antman
+          chmod +x antman
+          ./antman -S
+          export PATH="$HOME/neutron/bin:$PATH"
+          clang --version >/dev/null 2>&1 || ./antman --patch=glibc
+          clang --version | sed -n '1p'
+          ld.lld --version | sed -n '1p'
+          echo "$HOME/neutron/bin" >> "$GITHUB_PATH"
 
       - name: Buat helper build (kmake.sh)
         run: |
+          # LOCALVERSION= (kosong tapi terdefinisi) mematikan suffix '+' / -dirty dari scripts/setlocalversion
           cat > "$GITHUB_WORKSPACE/kmake.sh" <<'EOF'
           #!/usr/bin/env bash
           cd "$KSRC" || exit 1
-          LDARG=()
-          [ "${LINKER:-lld}" = "lld" ] && LDARG=(LD=ld.lld)
-          # LOCALVERSION= (kosong tapi terdefinisi) mencegah setlocalversion menambah '+' / -dirty
           exec make O=out ARCH=arm64 SUBARCH=arm64 \
-            CC=clang HOSTCC=clang HOSTCXX=clang++ "${LDARG[@]}" \
+            CC=clang HOSTCC=clang HOSTCXX=clang++ LD=ld.lld \
             AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
             READELF=llvm-readelf STRIP=llvm-strip \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
-            KCFLAGS="$KCF" \
-            LOCALVERSION= \
+            KCFLAGS="$KCF" LOCALVERSION= \
             "$@"
           EOF
           chmod +x "$GITHUB_WORKSPACE/kmake.sh"
 
-          cat > "$GITHUB_WORKSPACE/relax_werror.sh" <<'EOF'
-          #!/usr/bin/env bash
-          # Hapus -Werror polos dari Makefile/Kbuild vendor + driver KSU (symlink tidak diikuti find, jadi KDIR eksplisit)
-          set -eo pipefail
-          cd "$KSRC"
-          n=0
-          while IFS= read -r f; do
-            if grep -qE '(^|[[:space:]])-Werror([[:space:]]|$)' "$f"; then
-              sed -E -i 's/(^|[[:space:]])-Werror([[:space:]]|$)/\1\2/g' "$f"
-              n=$((n+1))
-            fi
-          done < <(find drivers techpack fs net sound security kernel mm lib block crypto arch/arm64 "${KDIR:-drivers/kernelsu}" \
-                     -type f \( -name Makefile -o -name Kbuild -o -name 'Makefile.*' \) 2>/dev/null)
-          echo "[i] -Werror dihapus dari $n Makefile"
-          EOF
-          chmod +x "$GITHUB_WORKSPACE/relax_werror.sh"
-
-          cat > "$GITHUB_WORKSPACE/gen_compile_h.sh" <<'EOF'
-          #!/usr/bin/env bash
-          # drivers/kernelsu/kernel_includes.h meng-include <generated/compile.h>. Di kernel 4.19 file itu hanya dibuat oleh
-          # rule init/Makefile (dependency init/version.o), jadi saat drivers/kernelsu dikompilasi lebih dulu / paralel dengan
-          # init/, header belum ada -> "fatal error: 'generated/compile.h' file not found". Buat dulu secara eksplisit.
-          set -uo pipefail
-          cd "$KSRC" || exit 1
-          H=out/include/generated/compile.h
-          "$GITHUB_WORKSPACE/kmake.sh" -j"$(nproc)" init/ > "$RUNNER_TEMP/compile_h.log" 2>&1 || true
-          if [ ! -s "$H" ]; then
-            echo "[i] 'make init/' tidak menghasilkan compile.h, memakai scripts/mkcompile_h langsung"
-            mkdir -p "$(dirname "$H")"
-            SMP=""; PRE=""
-            grep -qx 'CONFIG_SMP=y' out/.config && SMP=1
-            grep -qx 'CONFIG_PREEMPT=y' out/.config && PRE=1
-            # mkcompile_h bekerja relatif terhadap objtree (membaca/menulis .version), jadi jalankan dari out/
-            ( cd out && CONFIG_SHELL=bash bash ../scripts/mkcompile_h include/generated/compile.h arm64 "$SMP" "$PRE" "clang" ) \
-              || { tail -n 30 "$RUNNER_TEMP/compile_h.log"; echo "::error::gagal membuat compile.h"; exit 1; }
-          fi
-          [ -s "$H" ] || { tail -n 30 "$RUNNER_TEMP/compile_h.log"; echo "::error::compile.h kosong / tidak ada"; exit 1; }
-          echo "[OK] $H siap ($(wc -l < "$H") baris)"
-          EOF
-          chmod +x "$GITHUB_WORKSPACE/gen_compile_h.sh"
-
-      # -------------------------------------------------- versi, nama kernel, defconfig
-      - name: Deteksi versi, defconfig & terapkan nama kernel
+      - name: Deteksi versi, defconfig, nama kernel
         run: |
           cd "$KSRC"
-          VER=$(sed -nE 's/^VERSION[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' Makefile | head -n1)
-          PL=$(sed -nE 's/^PATCHLEVEL[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' Makefile | head -n1)
-          SL=$(sed -nE 's/^SUBLEVEL[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' Makefile | head -n1)
-          EV=$(sed -nE 's/^EXTRAVERSION[[:space:]]*=[[:space:]]*(.*)$/\1/p' Makefile | head -n1)
-          BASE="$VER.$PL.$SL"
           KVER=$(make -s kernelversion)
           SHA=$(git rev-parse --short HEAD)
-          echo "[i] Source: $KVER @ $SHA  (base=$BASE, EXTRAVERSION='$EV')"
+          case "$KERNEL_RELEASE" in
+            "$KVER"*) LV="${KERNEL_RELEASE#"$KVER"}" ;;
+            *) echo "::error::source kernel = $KVER, tidak cocok dgn nama yang diminta '$KERNEL_RELEASE'"; exit 1 ;;
+          esac
+          # file yang ikut membentuk uname -r di luar CONFIG_LOCALVERSION
+          rm -f .scmversion localversion*
 
-          # ---- defconfig
           if [ -n "$DEFCONFIG_IN" ]; then
             DEF="$DEFCONFIG_IN"
           else
             DEF=""
             for c in whyred_defconfig vendor/whyred_defconfig whyred-perf_defconfig vendor/whyred-perf_defconfig; do
-              if [ -f "arch/arm64/configs/$c" ]; then DEF="$c"; break; fi
+              [ -f "arch/arm64/configs/$c" ] && { DEF="$c"; break; }
             done
-            if [ -z "$DEF" ]; then
-              DEF=$(cd arch/arm64/configs && find . -type f -name '*whyred*' | sed 's|^\./||' | sort | sed -n '1p')
-            fi
+            [ -n "$DEF" ] || DEF=$(cd arch/arm64/configs && find . -type f -name '*whyred*' | sed 's|^\./||' | sort | sed -n '1p')
           fi
           if [ -z "$DEF" ] || [ ! -f "arch/arm64/configs/$DEF" ]; then
             echo "::error::defconfig whyred tidak ditemukan. Isi input 'defconfig'. Daftar config:"
             find arch/arm64/configs -type f | sort | sed -n '1,80p'
             exit 1
           fi
-          echo "[i] Defconfig: $DEF"
-
-          # ---- nama kernel: release = BASE + LV, LV diletakkan di CONFIG_LOCALVERSION
-          KNAME="$KNAME_IN"
-          case "$KNAME" in
-            "$BASE"*) LV="${KNAME#"$BASE"}" ;;
-            *)
-              LV="-${KNAME#*-}"
-              echo "::warning::kernel_name '$KNAME' tidak diawali versi source ($BASE). Release dipakai: ${BASE}${LV}"
-              ;;
-          esac
-          [ -n "$LV" ] || { echo "::error::kernel_name tidak memuat suffix"; exit 1; }
-          REL="${BASE}${LV}"
-          [ "${#REL}" -le 60 ] || { echo "::error::release '$REL' terlalu panjang (batas UTS 64)"; exit 1; }
-          echo "[i] Release target: $REL"
-
-          # EXTRAVERSION lama + file localversion* + .scmversion akan mengotori release
-          if [ -n "$EV" ]; then
-            echo "[i] EXTRAVERSION '$EV' dikosongkan"
-            sed -i -E 's/^EXTRAVERSION[[:space:]]*=.*/EXTRAVERSION =/' Makefile
-          fi
-          for f in localversion*; do
-            [ -e "$f" ] || continue
-            echo "[i] hapus $f ('$(cat "$f")')"
-            rm -f "$f"
-          done
-          : > .scmversion
-
-          # Karakter khusus shell (mis. tanda kurung) di release merusak rule utsrelease.h bawaan
-          # Makefile. Quoting HANYA dibutuhkan kalau release memuat karakter semacam itu; untuk
-          # release aman ([A-Za-z0-9._+-]) Makefile dibiarkan apa adanya.
-          if [[ "$REL" =~ [^A-Za-z0-9._+-] ]]; then
-          echo "[i] release memuat karakter khusus, quote rule utsrelease.h"
-          python3 - <<'PYEOF'
-          from pathlib import Path
-          import sys
-          p = Path('Makefile')
-          t = p.read_text()
-          old = '\\"$(KERNELRELEASE)\\"'
-          new = '\\""$(KERNELRELEASE)"\\"'
-          if new in t:
-              print('[=] rule utsrelease.h sudah ter-quote')
-          elif old in t:
-              p.write_text(t.replace(old, new))
-              print(f'[+] rule utsrelease.h di-quote ({t.count(old)} tempat)')
-          else:
-              print('::error::pola UTS_RELEASE di Makefile tidak dikenali; tidak aman memakai tanda kurung di release')
-              sys.exit(1)
-          PYEOF
-          else
-            echo "[i] release '$REL' aman, quoting utsrelease.h tidak diperlukan"
-          fi
-
+          echo "[i] Kernel $KVER @ $SHA | defconfig $DEF | nama akhir $KERNEL_RELEASE (LOCALVERSION='$LV')"
           {
             echo "KVER=$KVER"
-            echo "KBASE=$BASE"
             echo "KSHA=$SHA"
             echo "DEF=$DEF"
-            echo "KNAME=$KNAME"
             echo "LV=$LV"
-            echo "REL=$REL"
           } >> "$GITHUB_ENV"
 
-      # ---------------------------------------------- bersihkan sisa integrasi lama
-      - name: Bersihkan sisa KernelSU / SUSFS lama dari source
+          # SUSFS sudah dibawa fork legacy-susfs; sisa SUSFS dari source = definisi ganda saat link
+          OLD=$(find fs include -maxdepth 2 -iname '*susfs*' 2>/dev/null || true)
+          if [ -n "$OLD" ]; then
+            echo "::error::source sudah memuat file SUSFS lama (bentrok dgn SUSFS bawaan fork). Hapus dari source:"
+            echo "$OLD"
+            exit 1
+          fi
+
+      # --------------------------------------------------------- add-on 1+2: KSU-Next + SUSFS
+      - name: Integrasi KernelSU-Next legacy-susfs (setup.sh resmi, commit ter-pin)
         run: |
-          cat > "$RUNNER_TEMP/strip_ksu.py" <<'PYEOF'
-          #!/usr/bin/env python3
-          """Hapus semua blok #if*CONFIG_KSU* (hook KSU / SUSFS lama) dari source kernel.
-          Blok positif: isi 'then' dibuang, isi '#else' dipertahankan. Blok negatif: sebaliknya.
-          Bentuk non-standar (#elif, kondisi campuran) -> berhenti, tidak mengarang."""
-          import re, subprocess, sys
-          from pathlib import Path
-
-          def die(m):
-              print(f'::error::{m}')
-              sys.exit(1)
-
-          DIRS = ['fs', 'kernel', 'drivers', 'include', 'security', 'mm', 'block', 'arch',
-                  'net', 'init', 'lib', 'ipc', 'sound', 'techpack']
-          out = subprocess.run(
-              ['grep', '-rIlE', 'CONFIG_KSU|ksu_|susfs', '--include=*.c', '--include=*.h', '--include=*.S'] + DIRS,
-              capture_output=True, text=True).stdout.splitlines()
-          cands = [c for c in out if c and not c.startswith('drivers/kernelsu/')]
-
-          DIR_RE = re.compile(r'^[ \t]*#[ \t]*(ifdef|ifndef|if|elif|else|endif)\b(.*)$')
-          KSU_RE = re.compile(r'(!\s*)?(?:defined\s*\(\s*)?CONFIG_KSU\w*')
-
-          def classify(kind, rest, path):
-              if 'CONFIG_KSU' not in rest:
-                  return 'other'
-              if kind == 'ifndef':
-                  return 'neg'
-              if kind == 'ifdef':
-                  return 'pos'
-              if '||' in rest:
-                  die(f'{path}: kondisi campuran "{rest.strip()}" tidak bisa dibersihkan otomatis')
-              m = KSU_RE.search(rest)
-              return 'neg' if (m and m.group(1)) else 'pos'
-
-          def strip(text, path):
-              res, stack, changed = [], [], False
-              for line in text.split('\n'):
-                  m = DIR_RE.match(line)
-                  if not m:
-                      if all(e[1] for e in stack):
-                          res.append(line)
-                      continue
-                  kind, rest = m.group(1), m.group(2)
-                  if kind in ('if', 'ifdef', 'ifndef'):
-                      t = classify(kind, rest, path)
-                      parent = all(e[1] for e in stack)
-                      if t == 'pos':
-                          stack.append(['pos', False]); changed = True
-                      elif t == 'neg':
-                          stack.append(['neg', True]); changed = True
-                      else:
-                          stack.append(['other', True])
-                          if parent:
-                              res.append(line)
-                      continue
-                  if not stack:
-                      die(f'{path}: #{kind} tanpa pasangan')
-                  top = stack[-1]
-                  if kind == 'elif':
-                      if top[0] != 'other':
-                          die(f'{path}: #elif di dalam blok KSU tidak didukung pembersih otomatis')
-                      if all(e[1] for e in stack[:-1]):
-                          res.append(line)
-                  elif kind == 'else':
-                      if top[0] == 'pos':
-                          top[1] = True
-                      elif top[0] == 'neg':
-                          top[1] = False
-                      elif all(e[1] for e in stack[:-1]):
-                          res.append(line)
-                  else:  # endif
-                      stack.pop()
-                      if top[0] == 'other' and all(e[1] for e in stack):
-                          res.append(line)
-              if stack:
-                  die(f'{path}: #if tidak seimbang setelah pembersihan')
-              return '\n'.join(res), changed
-
-          n = 0
-          for c in cands:
-              p = Path(c)
-              t = p.read_bytes().decode('utf-8', 'surrogateescape')
-              t2, ch = strip(t, c)
-              if ch:
-                  p.write_bytes(t2.encode('utf-8', 'surrogateescape'))
-                  n += 1
-                  print(f'[-] blok KSU dibuang dari {c}')
-          print(f'[i] {n} file dibersihkan')
-
-          # sisa yang masih berupa kode (bukan komentar)
-          left = []
-          for c in cands:
-              for i, l in enumerate(Path(c).read_text(errors='replace').split('\n'), 1):
-                  s = l.strip()
-                  if s.startswith(('*', '/*', '//')):
-                      continue
-                  if re.search(r'CONFIG_KSU|\bksu_[a-z0-9_]+\b|susfs', l, re.I):
-                      left.append(f'{c}:{i}: {s}')
-          if left:
-              print('::error::masih ada referensi KSU/SUSFS lama berbentuk non-standar (hapus manual dari source):')
-              print('\n'.join(left[:80]))
-              sys.exit(1)
-          print('[OK] tidak ada sisa referensi ksu_/CONFIG_KSU/susfs di luar drivers/kernelsu')
-          PYEOF
           cd "$KSRC"
-          # file SUSFS lama + referensi build-nya
-          rm -f fs/susfs.c include/linux/susfs*.h
-          [ -f fs/Makefile ] && sed -i '/susfs/d' fs/Makefile
-          # KernelSU lama
           rm -rf KernelSU KernelSU-Next drivers/kernelsu
           sed -i '/kernelsu/d' drivers/Makefile
-          sed -i '/kernelsu\/Kconfig/d' drivers/Kconfig
-          python3 "$RUNNER_TEMP/strip_ksu.py"
+          sed -i '/drivers\/kernelsu\/Kconfig/d' drivers/Kconfig
 
-      # --------------------------------------------------------- add-on 1: SukiSU-Ultra
-      - name: Integrasi SukiSU-Ultra builtin (setup.sh resmi, membawa SUSFS + KPM)
-        run: |
-          cd "$KSRC"
-          # setup.sh resmi: clone repo ke KernelSU/, symlink drivers/kernelsu, tambah entri drivers/Makefile + drivers/Kconfig
-          curl -fsSL "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "$KSU_REF"
+          # perintah resmi README fork (symlink + Makefile + Kconfig); setelah itu dikunci ke commit yang diminta
+          curl -fsSL "https://raw.githubusercontent.com/Youffx/KernelSU-Next/legacy-susfs/kernel/setup.sh" | bash -s legacy-susfs
 
-          # setup.sh berakhir dengan 'git checkout "$1" || echo ...': ref yang salah TIDAK error, diam-diam tetap di branch default
-          [ -L drivers/kernelsu ] || { echo "::error::drivers/kernelsu bukan symlink, setup.sh gagal"; exit 1; }
-          KD=$(readlink -f drivers/kernelsu)
-          KROOT=$(git -C "$KD" rev-parse --show-toplevel)
-          BR=$(git -C "$KROOT" rev-parse --abbrev-ref HEAD)
-          [ "$BR" = "$KSU_REF" ] || { echo "::error::setup.sh tetap di branch '$BR', bukan '$KSU_REF' (branch tidak ada?)"; git -C "$KROOT" branch -r | sed -n '1,30p'; exit 1; }
-          [ -f "$KD/Kconfig" ] && { [ -f "$KD/Makefile" ] || [ -f "$KD/Kbuild" ]; } \
-            || { echo "::error::isi $KD tidak valid"; exit 1; }
-          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig && grep -q 'kernelsu' drivers/Makefile \
-            || { echo "::error::entri KSU belum ada di drivers/Kconfig / drivers/Makefile"; exit 1; }
+          cd KernelSU-Next
+          # versi KSU dihitung dari jumlah commit -> butuh riwayat penuh; lalu kunci ke commit yang diminta
+          [ "$(git rev-parse --is-shallow-repository)" = "true" ] && git fetch -q --unshallow --tags
+          SHA=$(git rev-parse --verify -q "${KSUN_REF}^{commit}") \
+            || { echo "::error::ref '$KSUN_REF' tidak ditemukan di KernelSU-Next"; exit 1; }
+          git checkout -q --detach "$SHA"
+          cd ..
 
-          # versi KSU dihitung dari jumlah commit -> clone dangkal bikin manager menolak kernel
-          if [ "$(git -C "$KROOT" rev-parse --is-shallow-repository)" = "true" ]; then
-            git -C "$KROOT" fetch --unshallow --tags || echo "::warning::unshallow gagal"
-          fi
-          KSU_SHA=$(git -C "$KROOT" rev-parse HEAD)
-          echo "[i] SukiSU-Ultra@${KSU_REF} = $KSU_SHA ($(git -C "$KROOT" rev-list --count HEAD) commit)"
-          {
-            echo "KDIR=$(realpath --relative-to="$KSRC" "$KD")"
-            echo "KSU_SHA=${KSU_SHA:0:9}"
-          } >> "$GITHUB_ENV"
-          echo "----- simbol Kconfig SukiSU -----"
-          find "$KD" -type f \( -name 'Kconfig' -o -name 'Kconfig.*' \) -exec sed -nE 's/^[[:space:]]*config[[:space:]]+([A-Z0-9_]+).*/\1/p' {} + | sort -u | tr '\n' ' '
-          echo
+          case "$(git -C KernelSU-Next remote get-url origin | tr 'A-Z' 'a-z')" in
+            *youffx/kernelsu-next*) ;;
+            *) echo "::error::origin KernelSU-Next bukan Youffx/KernelSU-Next"; exit 1 ;;
+          esac
+          [ -L drivers/kernelsu ] && [ -f drivers/kernelsu/Kconfig ] \
+            && { [ -f drivers/kernelsu/Kbuild ] || [ -f drivers/kernelsu/Makefile ]; } \
+            || { echo "::error::symlink drivers/kernelsu tidak valid"; exit 1; }
+          [ "$(grep -c 'drivers/kernelsu/Kconfig' drivers/Kconfig)" = "1" ] \
+            || { echo "::error::source Kconfig KSU harus tepat 1x di drivers/Kconfig"; exit 1; }
+          grep -q 'kernelsu' drivers/Makefile || { echo "::error::drivers/Makefile belum memuat kernelsu"; exit 1; }
+          [ -d KernelSU-Next/kernel/susfs ] || { echo "::error::kernel/susfs tidak ada di commit ini (bukan legacy-susfs?)"; exit 1; }
 
-      # ------------------------------------------------------------ SUSFS (hanya dari builtin)
-      - name: SUSFS dari branch builtin (tanpa patch eksternal)
-        run: |
-          cd "$KSRC"
-          REPORT="$GITHUB_WORKSPACE/reports/susfs.log"
-          : > "$REPORT"
-          if [ "$SUSFS_ENABLE" != "true" ]; then
-            echo "[i] susfs=false: build baseline tanpa SUSFS"
-            echo "SUSFS_ACTIVE=false" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          KD=$(readlink -f drivers/kernelsu)
+          echo "KSUN_SHA=${SHA:0:9}" >> "$GITHUB_ENV"
+          echo "[i] KernelSU-Next @ ${SHA:0:9} ($(git -C KernelSU-Next rev-list --count HEAD) commit)"
+          echo "[i] simbol config fork: $(grep -rhoE '^config [A-Z0-9_]+' KernelSU-Next/kernel --include='Kconfig*' | cut -d' ' -f2 | sort -u | tr '\n' ' ')"
 
-          # 1) source kernel harus bersih dari SUSFS non-builtin (sisa integrasi lama / patch eksternal)
-          LEFT=$(grep -rIliE 'susfs' --include='*.c' --include='*.h' --include='Makefile' --include='Kconfig*' \
-                   fs include kernel mm security block arch init lib ipc net 2>/dev/null || true)
-          if [ -n "$LEFT" ]; then
-            echo "::error::masih ada referensi SUSFS non-builtin di source kernel (seharusnya sudah dibersihkan):"
-            echo "$LEFT"; exit 1
-          fi
-          echo "[OK] source kernel bersih dari SUSFS non-builtin"
-
-          # 2) opsi SUSFS harus datang dari Kconfig builtin
-          grep -rqE '^[[:space:]]*config[[:space:]]+KSU_SUSFS[[:space:]]*$' "$KD" --include='Kconfig*' \
-            || { echo "::error::CONFIG_KSU_SUSFS tidak didefinisikan di Kconfig SukiSU@${KSU_REF}"; exit 1; }
-
-          # 3) laporan: apa yang dibawa builtin (versi SUSFS bila ada)
-          {
-            echo "builtin: $KD"
-            echo "--- file di builtin yang menyebut susfs ---"
-            grep -rIli 'susfs' "$KD" 2>/dev/null | sed "s|^$KD/||" | sort
-          } >> "$REPORT"
-          SV=$(grep -rhoE '#define[[:space:]]+SUSFS_VERSION[[:space:]]+"v?[0-9][0-9.]*"' "$KD" 2>/dev/null \
-                 | grep -oE '[0-9][0-9.]*' | head -n1 || true)
-          echo "[i] SUSFS builtin: v${SV:-?} (versi dari header builtin; kosong = builtin tidak mendeklarasikan)"
-          echo "SUSFS_ACTIVE=true" >> "$GITHUB_ENV"
-          [ -z "$SV" ] || echo "SUSFS_NUM=$SV" >> "$GITHUB_ENV"
-
-      # ------------------------------------------------- hook manual (panduan SukiSU builtin)
-      - name: Hook manual SukiSU builtin + audit simbol (idempotent, gagal keras)
+      - name: Manual hooks KernelSU-Next (bersihkan KSU lama + hook sesuai panduan)
         run: |
           cat > "$RUNNER_TEMP/ksu_hooks.py" <<'PYEOF'
           #!/usr/bin/env python3
-          """Hook manual SukiSU-Ultra (branch builtin) sesuai https://sukisu.org/guide/how-to-integrate
-          - prototype dibaca dari source SukiSU yang benar-benar di-clone
-          - hook TIDAK dipasang kalau fungsi syscall itu sudah memuat hook ksu_*
-          - setelah itu: audit duplikat + audit simbol yang dipanggil kernel tapi tidak didefinisikan KSU"""
-          import os, re, subprocess, sys
+          """Manual hook KernelSU-Next (legacy-susfs) mengikuti panduan resmi:
+          https://kernelsu-next.github.io/webpage/pages/how-to-integrate-for-non-gki.html
+
+          Urutan: (1) bersihkan SEMUA kode KSU lama di source kernel, (2) baca API fungsi dari
+          KernelSU-Next yang di-pin, (3) pasang hook, (4) tulis manifest untuk verifikasi binary.
+          Anchor tidak cocok = build berhenti dengan pesan jelas. Tidak ada yang dilewati diam-diam."""
+          import re
+          import subprocess
+          import sys
           from pathlib import Path
 
-          KDIR = Path(os.environ['KDIR'])
-          REPORT = Path(os.environ['GITHUB_WORKSPACE']) / 'reports' / 'hooks.txt'
-          rep = []
+          KSU = Path('KernelSU-Next/kernel')
+          MANIFEST = Path(sys.argv[1])
+
 
           def die(m):
               print(f'::error::{m}')
-              REPORT.write_text('\n'.join(rep + ['ERROR: ' + m]))
               sys.exit(1)
 
-          def warn(m):
-              print(f'::warning::{m}')
-              rep.append('WARN: ' + m)
 
-          def log(m):
-              print(m)
-              rep.append(m)
+          def note(m):
+              print(f'::notice::{m}')
+
 
           def rd(p):
               return Path(p).read_bytes().decode('utf-8', 'surrogateescape')
 
+
           def wr(p, t):
               Path(p).write_bytes(t.encode('utf-8', 'surrogateescape'))
 
-          if not KDIR.is_dir():
-              die(f'{KDIR} tidak ada')
 
-          # ---- normalisasi signature sucompat (kernel < 6.1).
-          # Varian CONFIG_KSU_SUSFS dari ksu_handle_faccessat/ksu_handle_stat memakai `struct filename **` dan hanya
-          # benar kalau caller (fs/open.c, fs/stat.c) sudah ditulis ulang ala kernel >= 6.1 (getname_flags). Hook panduan
-          # memakai `const char __user **`. Mismatch kompilasi bersih tapi UB saat runtime (boot hang).
-          def kernel_ver():
-              mk = Path('Makefile').read_text()
-              return (int(re.search(r'(?m)^VERSION\s*=\s*(\d+)', mk).group(1)),
-                      int(re.search(r'(?m)^PATCHLEVEL\s*=\s*(\d+)', mk).group(1)))
+          def git_grep(pattern, *globs):
+              r = subprocess.run(['git', 'grep', '-nIE', pattern, '--', *globs,
+                                  ':(exclude)KernelSU-Next', ':(exclude)drivers/kernelsu'],
+                                 capture_output=True, text=True)
+              return [l for l in r.stdout.splitlines() if l.strip()]
 
-          NORM_RE = re.compile(r'\b(ksu_handle_faccessat|ksu_handle_stat)\s*\(')
-          def normalize_signatures():
-              n_changed = 0
-              for fp in sorted(KDIR.rglob('*')):
-                  if not (fp.is_file() and fp.suffix in ('.c', '.h')):
+
+          if not KSU.is_dir():
+              die('KernelSU-Next/kernel tidak ada')
+
+          # ================================================================ 1. BERSIHKAN KSU LAMA
+          DIRECTIVE = re.compile(r'^[ \t]*#[ \t]*(ifdef|ifndef|if|elif|else|endif)\b(.*)$')
+          KSU_COND = re.compile(r'CONFIG_KSU\w*')
+
+
+          def strip_ksu_blocks(text, name):
+              """Hapus blok #ifdef CONFIG_KSU* (cabang #else dipertahankan, seperti kernel tanpa KSU)."""
+              out, stack, removed = [], [], 0
+
+              def dropping():
+                  return any(f['drop'] for f in stack)
+
+              for ln, line in enumerate(text.split('\n'), 1):
+                  m = DIRECTIVE.match(line)
+                  if not m:
+                      if not dropping():
+                          out.append(line)
                       continue
-                  L = rd(fp).split('\n')
-                  touched = False
-                  for i, l in enumerate(L):
-                      if not NORM_RE.search(l):
-                          continue
-                      head = l.split('(')[0].strip()
-                      if l.strip().startswith(('*', '/*', '//', 'return')) or '=' in head or not head:
-                          continue
-                      sig = ' '.join(x.strip() for x in L[i:i + 3])
-                      if not re.search(r'struct\s+filename\s*\*\s*\*', sig):
-                          continue
-                      depth, j, ctrl = 0, i - 1, None
-                      while j >= 0:
-                          mm = re.match(r'\s*#\s*(ifdef|ifndef|if|elif|else|endif)\b(.*)', L[j])
-                          if mm:
-                              k = mm.group(1)
-                              if k == 'endif':
-                                  depth += 1
-                              elif k in ('if', 'ifdef', 'ifndef'):
-                                  if depth == 0:
-                                      ctrl = (j, k, mm.group(2).strip())
-                                      break
-                                  depth -= 1
-                              elif k in ('else', 'elif') and depth == 0:
-                                  ctrl = (j, 'else', '')
-                                  break
-                          j -= 1
-                      if ctrl is None or ctrl[1] in ('else', 'ifndef'):
-                          log(f'[?] {fp}:{i + 1}: varian struct filename ** berada di cabang #else/#ifndef -> tidak diubah')
-                          continue
-                      j, k, expr = ctrl
-                      if k == 'ifdef':
-                          expr = f'defined({expr})'
-                      if 'CONFIG_KSU_SUSFS' not in expr:
-                          log(f'[?] {fp}:{i + 1}: varian struct filename ** tidak dijaga CONFIG_KSU_SUSFS ({expr}) -> tidak diubah')
-                          continue
-                      if 'LINUX_VERSION_CODE' in expr or 'KERNEL_VERSION' in expr:
-                          log(f'[=] {fp}:{i + 1}: guard sudah memuat versi kernel ({expr})')
-                          continue
-                      ind = re.match(r'\s*', L[j]).group(0)
-                      L[j] = f'{ind}#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0) && ({expr})'
-                      touched = True
-                      n_changed += 1
-                      log(f'[+] {fp}:{j + 1}: guard varian struct filename ** dibatasi kernel >= 6.1: {expr}')
-                  if touched:
-                      txt = '\n'.join(L)
-                      if 'linux/version.h' not in txt:
-                          txt = re.sub(r'(?m)^(#include [<"][^\n]+\n)', r'\1#include <linux/version.h>\n', txt, count=1)
-                      wr(fp, txt)
-              return n_changed
+                  kind, rest = m.group(1), m.group(2)
+                  cond = re.sub(r'/\*.*?\*/|//.*$', '', rest)
+                  is_ksu = bool(KSU_COND.search(cond))
+                  if kind in ('if', 'ifdef', 'ifndef'):
+                      if is_ksu:
+                          if re.search(r'&&|\|\|', cond):
+                              raise ValueError(f'{name}:{ln}: kondisi KSU kompleks: {line.strip()}')
+                          neg = kind == 'ifndef' or re.match(r'\s*!', cond) is not None
+                          stack.append({'ksu': True, 'neg': neg, 'drop': not neg})
+                          removed += 1
+                      else:
+                          stack.append({'ksu': False, 'drop': False})
+                          if not dropping():
+                              out.append(line)
+                  elif kind == 'elif':
+                      if not stack or stack[-1]['ksu'] or is_ksu:
+                          raise ValueError(f'{name}:{ln}: #elif terkait KSU tidak didukung: {line.strip()}')
+                      if not dropping():
+                          out.append(line)
+                  elif kind == 'else':
+                      if not stack:
+                          raise ValueError(f'{name}:{ln}: #else tanpa #if')
+                      f = stack[-1]
+                      if f['ksu']:
+                          f['drop'] = f['neg']
+                      elif not dropping():
+                          out.append(line)
+                  else:  # endif
+                      if not stack:
+                          raise ValueError(f'{name}:{ln}: #endif tanpa #if')
+                      f = stack.pop()
+                      if not f['ksu'] and not dropping():
+                          out.append(line)
+              if stack:
+                  raise ValueError(f'{name}: preprocessor tidak seimbang')
+              return '\n'.join(out), removed
 
-          if kernel_ver() < (6, 1):
-              normalize_signatures()
-              _s = '\n'.join(rd(p) for p in sorted(KDIR.rglob('*')) if p.is_file() and p.suffix in ('.c', '.h'))
-              miss = [n for n in ('ksu_handle_faccessat', 'ksu_handle_stat')
-                      if not re.search(re.escape(n) + r'\s*\(\s*int\s*\*\s*\w*\s*,\s*const\s+char\s+__user\s*\*\s*\*', _s)]
-              if miss:
-                  die('SukiSU ref ini tidak punya varian `const char __user **` untuk ' + ', '.join(miss)
-                      + ' (hanya struct filename **). Hook panduan tidak bisa dipakai di kernel < 6.1 tanpa menulis ulang caller; '
-                      + 'pakai ref SukiSU yang masih punya varian itu (ksu_ref=<commit/tag>) atau hook SUSFS inline.')
-              log('[OK] varian const char __user ** tersedia untuk faccessat/stat (cocok dengan hook panduan)')
-          ksrc_files = [p for p in sorted(KDIR.rglob('*')) if p.is_file() and p.suffix in ('.c', '.h')]
-          src = '\n'.join(rd(p) for p in ksrc_files)
 
-          def find_def(name):
-              """(params, arity) kalau name didefinisikan (bukan sekadar dideklarasikan) di source KSU."""
-              for m in re.finditer(r'(?m)^(?!extern\b|#)(?:[A-Za-z_][\w \t\*\(\)]*?)?\b' + re.escape(name) + r'[ \t]*\(', src):
-                  i = m.end()
-                  depth, j = 1, i
-                  while j < len(src) and depth:
-                      depth += (src[j] == '(') - (src[j] == ')')
-                      j += 1
-                  params = ' '.join(src[i:j - 1].split())
-                  rest = re.sub(r'(?m)^[ \t]*#.*$', '', src[j:j + 400]).lstrip()
-                  if not rest.startswith('{'):
-                      continue
-                  if params in ('', 'void'):
-                      return params, 0
-                  d, n = 0, 1
-                  for ch in params:
-                      if ch == '(':
-                          d += 1
-                      elif ch == ')':
-                          d -= 1
-                      elif ch == ',' and d == 0:
-                          n += 1
-                  return params, n
-              return None
+          old_files = sorted({l.split(':', 1)[0] for l in git_grep(r'CONFIG_KSU', '*.c', '*.h')})
+          total = 0
+          for f in old_files:
+              try:
+                  new, n = strip_ksu_blocks(rd(f), f)
+              except ValueError as e:
+                  die(f'gagal membersihkan KSU lama: {e}')
+              wr(f, new)
+              total += n
+              print(f'    - {f}: {n} blok KSU lama dihapus')
+          print(f'[+] {total} blok KSU lama dihapus dari {len(old_files)} file' if old_files
+                else '[OK] source tidak punya blok CONFIG_KSU lama')
 
-          # key, simbol, argumen, wajib
+          res = git_grep(r'CONFIG_KSU', '*.c', '*.h') + [
+              l for l in git_grep(r'\bksu_[a-z0-9_]+', '*.c', '*.h')
+              if not re.match(r'^[^:]+:\d+:\s*(//|/\*|\*)', l)]
+          if res:
+              print('\n'.join(res[:40]))
+              die('Masih ada referensi KSU di luar blok #ifdef CONFIG_KSU (tidak bisa dibersihkan otomatis). '
+                  'Hapus manual dari source kernel lalu jalankan ulang.')
+
+          # ================================================= 2. BACA API KernelSU-Next (commit ter-pin)
+          src = '\n'.join(rd(p) for p in sorted(KSU.rglob('*')) if p.is_file() and p.suffix in ('.c', '.h'))
+          ATTR = r'(?:__attribute__\(\([^)]*\)\)[ \t]+)?'
+
+
+          def proto(name):
+              m = re.search(r'(?m)^[ \t]*' + ATTR + r'(?:extern[ \t]+)?(int|bool|void|long)[ \t]+'
+                            + ATTR + re.escape(name) + r'[ \t]*\(([^;{}]*?)\)[ \t\r\n]*\{', src)
+              if not m:
+                  return None
+              params = ' '.join(m.group(2).split())
+              n = 0 if params in ('', 'void') else params.count(',') + 1
+              return m.group(1), params, n
+
+
+          def has_var(name):
+              return re.search(r'(?m)^[ \t]*bool[ \t]+' + re.escape(name) + r'\b', src) is not None
+
+
+          # (kunci, simbol, jumlah argumen, wajib)  -- lima hook resmi + input (safe mode) bila ada
           SPEC = [
               ('execveat', 'ksu_handle_execveat', 5, True),
               ('faccessat', 'ksu_handle_faccessat', 4, True),
               ('stat', 'ksu_handle_stat', 3, True),
               ('reboot', 'ksu_handle_sys_reboot', 4, True),
+              ('read', 'ksu_handle_sys_read', None, False),
+              ('input', 'ksu_handle_input_handle_event', 3, False),
+              # fstat(init.rc) harus melaporkan st_size + panjang rc injeksi (Android Canary 2601+, libbase
+              # ReadFdToString hanya membaca sebanyak st_size). Tanpa ini rc KSU tidak pernah terbaca init.
               ('newfstat', 'ksu_handle_newfstat_ret', 2, False),
           ]
-          use = {}
-          bad = []
+          P, use, bad = {}, {}, []
           for key, sym, arity, req in SPEC:
-              d = find_def(sym)
-              if d is None:
-                  (bad.append(f'{sym} tidak didefinisikan SukiSU') if req
-                   else warn(f'{sym} tidak ada di SukiSU -> hook {key} dilewati (Android 16+ butuh newfstat_ret)'))
+              p = proto(sym)
+              if p is None:
+                  if req:
+                      bad.append(f'{sym} tidak didefinisikan KernelSU-Next')
                   use[key] = False
-              elif d[1] != arity:
-                  (bad.append(f'{sym}: {d[1]} argumen, panduan: {arity} ({d[0]})') if req
-                   else warn(f'{sym}: {d[1]} argumen, panduan: {arity} -> dilewati'))
+              elif arity is not None and p[2] != arity:
+                  if req:
+                      bad.append(f'{sym}: {p[2]} argumen, diharapkan {arity}')
+                  use[key] = False
+              elif key == 'read' and p[2] not in (1, 3):
                   use[key] = False
               else:
-                  use[key] = True
-                  log(f'[i] {sym}({d[0]})')
-          # diagnosa: semua entry-point ksu_* yang didefinisikan driver (untuk membandingkan dengan hook terpasang)
-          defs = sorted(set(re.findall(r'(?m)^(?!extern\b|#|static\b)[A-Za-z_][^\n;(]*?\b(ksu_[a-z0-9_]+)\s*\([^;{]*\)\s*\{', src)))
-          log('[i] fungsi ksu_* yang didefinisikan driver: ' + ', '.join(defs[:80]))
-          fst = [d for d in defs if 'fstat' in d or 'stat' in d]
-          log('[i] kandidat hook stat/fstat di driver: ' + (', '.join(fst) if fst else '(tidak ada)'))
-          if not use.get('newfstat'):
-              warn('ksu_handle_newfstat_ret TIDAK didefinisikan SukiSU ref ini: hook newfstat tidak dipasang '
-                   '(builtin ini menangani rc-injection dengan cara lain). Jangan dipaksa: memanggil simbol yang tidak ada = gagal link.')
+                  P[sym], use[key] = p, True
           if bad:
-              die('Versi SukiSU ini tidak cocok dengan template hook panduan: ' + '; '.join(bad))
+              die('KernelSU-Next ini tidak cocok dgn panduan manual hook: ' + '; '.join(bad))
 
-          def func_span(text, func_re):
+          SUC = 'ksu_handle_execveat_sucompat'
+          if (proto(SUC) or (None, None, 0))[2] == 5:
+              P[SUC] = proto(SUC)
+          VFS = 'ksu_handle_vfs_read'
+          if (proto(VFS) or (None, None, 0))[2] == 4:
+              P[VFS] = proto(VFS)
+          print('[i] API terdeteksi:', ', '.join(sorted(P)))
+
+
+          # ============================================================== 3. PASANG HOOK
+          def include_idx(lines):
+              depth, last = 0, -1
+              for i, l in enumerate(lines[:300]):
+                  s = l.strip()
+                  if re.match(r'#\s*if', s):
+                      depth += 1
+                  elif re.match(r'#\s*endif', s):
+                      depth = max(0, depth - 1)
+                  elif depth == 0 and re.match(r'#\s*include\b', s):
+                      last = i
+              return last
+
+
+          def add_decl(text, block):
+              lines = text.split('\n')
+              i = include_idx(lines)
+              if i < 0:
+                  return None
+              lines[i + 1:i + 1] = [''] + block.split('\n')
+              return '\n'.join(lines)
+
+
+          def insert(text, func_re, anchor_re, block, after=False):
               m = re.search(func_re, text, re.M)
               if not m:
                   return None
               end = text.find('\n}', m.end())
-              return (m.start(), end) if end >= 0 else None
-
-          def hook(path, label, func_res, anchors, block, last=False, required=True):
-              if not Path(path).exists():
-                  return (die if required else warn)(f'{path} tidak ada')
-              t = rd(path)
-              sp = None
-              for fr in func_res:
-                  sp = func_span(t, fr)
-                  if sp:
-                      break
-              if not sp:
-                  return (die if required else warn)(f'{path}: fungsi untuk hook {label} tidak ditemukan')
-              s, e = sp
-              body = t[s:e]
-              if re.search(r'\bksu_\w+', body):
-                  return log(f'[=] {path}: {label} sudah memuat hook ksu_* di fungsinya -> dilewati')
-              am = None
-              for a in anchors:
-                  ms = list(re.finditer(a, body, re.M))
-                  if ms:
-                      am = ms[-1] if last else ms[0]
-                      break
+              if end < 0:
+                  return None
+              am = re.compile(anchor_re, re.M).search(text, m.end(), end)
               if not am:
-                  return (die if required else warn)(f'{path}: anchor hook {label} tidak ditemukan')
-              ls = t.rfind('\n', 0, s + am.start()) + 1
+                  return None
+              ls = text.rfind('\n', 0, am.start()) + 1
+              if after:
+                  le = text.find('\n', am.end())
+                  le = len(text) if le < 0 else le + 1
+                  return text[:le] + block + text[le:]
               pe = ls - 1
-              ps = t.rfind('\n', 0, pe) + 1
-              prev = t[ps:pe].strip()
+              ps = text.rfind('\n', 0, pe) + 1
+              prev = text[ps:pe].strip()
               if prev.startswith('/*') and prev.endswith('*/'):
                   ls = ps
-              wr(path, t[:ls] + block + t[ls:])
-              log(f'[+] {path}: hook {label} terpasang')
+              return text[:ls] + block + text[ls:]
 
-          EXEC = ('#ifdef CONFIG_KSU\n'
-                  '\textern int ksu_handle_execveat(int *, struct filename **, void *, void *, int *);\n'
-                  '\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n'
-                  '#endif\n\n')
-          FACC = ('#ifdef CONFIG_KSU\n'
-                  '\textern int ksu_handle_faccessat(int *, const char __user **, int *, int *);\n'
-                  '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n'
-                  '#endif\n')
-          STAT = ('#ifdef CONFIG_KSU\n'
-                  '\textern int ksu_handle_stat(int *, const char __user **, int *);\n'
-                  '\tksu_handle_stat(&dfd, &filename, &flag);\n'
-                  '#endif\n\n')
-          NFST = ('#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_KPROBES_KSUD)\n'
-                  '#pragma GCC diagnostic push\n'
-                  '#pragma GCC diagnostic ignored "-Wdeclaration-after-statement"\n'
-                  '\textern void ksu_handle_newfstat_ret(unsigned int *, struct stat __user **);\n'
-                  '\tksu_handle_newfstat_ret(&fd, &statbuf);\n'
-                  '#pragma GCC diagnostic pop\n'
-                  '#endif\n\n')
-          REBT = ('#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_KPROBES_KSUD)\n'
-                  '\textern int ksu_handle_sys_reboot(int, int, unsigned int, void __user **);\n'
-                  '\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n'
-                  '#endif\n\n')
 
-          hook('fs/exec.c', 'execveat',
-               [r'^static int __do_execve_file\([^{]*\{', r'^static int do_execveat_common\([^{]*\{'],
-               [r'^[ \t]*if \(IS_ERR\(filename\)\)'], EXEC)
-          hook('fs/open.c', 'faccessat', [r'^SYSCALL_DEFINE3\(faccessat,[^{]*\{'],
-               [r'^[ \t]*return do_faccessat\(dfd, filename, mode(?:, 0)?\);', r'^[ \t]*if \(mode & ~S_IRWXO\)'], FACC)
-          ST_ANCHOR = [r'^[ \t]*error = vfs_fstatat\(dfd, filename, &stat, flag\);']
-          hook('fs/stat.c', 'newfstatat', [r'^SYSCALL_DEFINE4\(newfstatat,[^{]*\{'], ST_ANCHOR, STAT)
-          hook('fs/stat.c', 'fstatat64 (32-bit)', [r'^SYSCALL_DEFINE4\(fstatat64,[^{]*\{'], ST_ANCHOR, STAT, required=False)
-          if use['newfstat']:
-              hook('fs/stat.c', 'newfstat_ret (Android 16+)', [r'^SYSCALL_DEFINE2\(newfstat,[^{]*\{'],
-                   [r'^[ \t]*return error;'], NFST, last=True, required=False)
-          hook('kernel/reboot.c', 'sys_reboot', [r'^SYSCALL_DEFINE4\(reboot,[^{]*\{'],
-               [r'^[ \t]*if \(!ns_capable\(pid_ns->user_ns, CAP_SYS_BOOT\)\)'], REBT)
+          def decl(sym, extra=''):
+              ret, params, _ = P[sym]
+              # struct user_arg_ptr privat di fs/exec.c -> seperti panduan resmi, pakai void *
+              params = params.replace('struct user_arg_ptr *', 'void *')
+              return '#ifdef CONFIG_KSU\n' + extra + f'extern {ret} {sym}({params});\n#endif'
 
-          # ------------------------------------------------------------ audit
-          DIRS = ['fs', 'kernel', 'drivers', 'include', 'security', 'mm', 'block', 'arch', 'net', 'init', 'lib', 'ipc']
-          files = subprocess.run(['grep', '-rIlE', r'\bksu_[a-z0-9_]+', '--include=*.c', '--include=*.h'] + DIRS,
-                                 capture_output=True, text=True).stdout.splitlines()
-          ext = [f for f in files if f and not f.startswith(str(KDIR) + '/') and not f.startswith('drivers/kernelsu/')]
 
-          log('----- inventaris hook ksu_* di luar driver KSU -----')
-          used = {}
-          for f in ext:
-              text = rd(f)
-              chunks = re.split(r'(?m)^\}\s*$', text)
-              for ch in chunks:
-                  cnt = {}
-                  for l in ch.split('\n'):
-                      s = l.strip()
-                      if s.startswith(('*', '/*', '//')) or 'extern' in s:
-                          continue
-                      for sym in re.findall(r'\b(ksu_[a-z0-9_]+)\s*\(', s):
-                          cnt[sym] = cnt.get(sym, 0) + 1
-                  for sym, c in cnt.items():
-                      if c > 1:
-                          die(f'{f}: {sym} dipanggil {c}x di satu fungsi (hook ganda). Sisa hook lama + hook manual bentrok')
-              for i, l in enumerate(text.split('\n'), 1):
-                  s = l.strip()
-                  if s.startswith(('*', '/*', '//')):
+          def wrap(body):
+              return '#ifdef CONFIG_KSU\n' + body + '#endif\n'
+
+
+          PATCHED = []
+
+
+          def patch(path, sym, sites, extra_decl='', required=True):
+              def fail(msg):
+                  if required:
+                      die(msg)
+                  print(f'::warning::{msg} -> hook opsional dilewati')
+
+              if not Path(path).exists():
+                  return fail(f'{path} tidak ada')
+              t = rd(path)
+              for func_re, anchor_re, body, after, site_req in sites:
+                  t2 = insert(t, func_re, anchor_re, wrap(body), after)
+                  if t2 is None:
+                      if site_req:
+                          return fail(f'{path}: anchor untuk {sym} tidak ditemukan ({func_re})')
                       continue
-                  for sym in re.findall(r'\b(ksu_[a-z0-9_]+)\b', s):
-                      used.setdefault(sym, set()).add(f)
-                  if re.search(r'\bksu_[a-z0-9_]+\s*\(', s) and 'extern' not in s:
-                      log(f'    {f}:{i}: {s}')
-          if not used:
-              die('tidak ada satu pun hook ksu_* terpasang di kernel')
-          def defined_in_ksu(sym):
-              return re.search(r'(?m)^(?!extern\b)(?!#)[A-Za-z_][^\n]*\b' + re.escape(sym) + r'\b', src) is not None
+                  t = t2
+              t2 = add_decl(t, decl(sym, extra_decl))
+              if t2 is None:
+                  return fail(f'{path}: tidak menemukan #include level-atas')
+              wr(path, t2)
+              PATCHED.append((path, sym))
+              print(f'[+] {path}: hook {sym} terpasang')
 
-          missing = sorted(s for s in used if not defined_in_ksu(s))
-          if missing:
-              die('Kernel memanggil simbol KSU yang TIDAK didefinisikan SukiSU ref ini (API tidak cocok, akan gagal link): '
-                  + ', '.join(f'{s} [{", ".join(sorted(used[s]))}]' for s in missing))
-          log(f'[OK] {len(used)} simbol ksu_* yang dipakai kernel semuanya didefinisikan oleh SukiSU')
 
-          # diagnosa (tidak fatal): entry point ksu_handle_* yang dideklarasikan header SukiSU tetapi tidak dipanggil kernel.
-          # Kalau ada yang relevan (mis. jalur rc-injection Android 16+), terlihat di reports/hooks.txt tanpa menebak.
-          try:
-              hdr = '\n'.join(rd(q) for q in sorted(KDIR.rglob('*.h')))
-              unused = sorted(n for n in set(re.findall(r'\bksu_handle_[a-z0-9_]+', hdr)) if n not in used)
-              log('[i] entry point hook dideklarasikan SukiSU tetapi tidak dipanggil dari kernel: ' + (', '.join(unused) or '(tidak ada)'))
-          except Exception as e:
-              warn(f'diagnosa entry point gagal: {e}')
+          # --- exec: satu titik di do_execveat_common = execve + execveat + compat sekaligus.
+          #     Bionic baru (Android 17) memetakan execve() ke execveat(); hook di do_execve saja (panduan
+          #     untuk bionic lama) tidak akan melihatnya.
+          exec_text = rd('fs/exec.c')
+          if re.search(r'^static int do_execveat_common\([^{]*\{\s*return __do_execve_file\(fd, filename, argv, envp, flags, NULL\);',
+                       exec_text, re.M):
+              if SUC in P and has_var('ksu_execveat_hook'):
+                  body = ('\tif (unlikely(ksu_execveat_hook))\n'
+                          '\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n'
+                          '\telse\n'
+                          f'\t\t{SUC}(&fd, &filename, &argv, &envp, &flags);\n')
+                  xd = ('extern bool ksu_execveat_hook __read_mostly;\n'
+                        + decl(SUC).split('\n')[1] + '\n')
+                  PATCHED.append(('fs/exec.c', SUC))
+              else:
+                  body, xd = '\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n', ''
+              patch('fs/exec.c', 'ksu_handle_execveat', [
+                  (r'^static int do_execveat_common\([^{]*\{',
+                   r'^[ \t]*return __do_execve_file\(fd, filename, argv, envp, flags, NULL\);',
+                   body, False, True)], xd)
+          else:
+              print('[i] exec: do_execveat_common bukan bentuk 4.18+, pakai do_execve/compat_do_execve (panduan resmi)')
+              A = r'^[ \t]*return do_execveat_common\(AT_FDCWD, filename, argv, envp, 0\);'
+              B = '\tksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);\n'
+              patch('fs/exec.c', 'ksu_handle_execveat', [
+                  (r'^int do_execve\(struct filename \*filename,[^{]*\{', A, B, False, True),
+                  (r'^(?:static[ \t]+)?int compat_do_execve\(struct filename \*filename,[^{]*\{', A, B, False, False)])
 
-          REPORT.write_text('\n'.join(rep))
-          (REPORT.parent / 'hooks.env').write_text('HOOK_NEWFSTAT=' + ('true' if 'ksu_handle_newfstat_ret' in used else 'false') + '\n')
-          print('[OK] hook + audit selesai')
+          open_text = rd('fs/open.c')
+          patch('fs/open.c', 'ksu_handle_faccessat', [
+              (r'^SYSCALL_DEFINE3\(faccessat,[^{]*\{',
+               r'^[ \t]*return do_faccessat\(dfd, filename, mode\);' if re.search(
+                   r'^[ \t]*return do_faccessat\(dfd, filename, mode\);', open_text, re.M)
+               else r'^[ \t]*if \(mode & ~S_IRWXO\)',
+               '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n', False, True)])
+
+          STAT = r'^[ \t]*error = vfs_fstatat\(dfd, filename, &stat, flag\);'
+          patch('fs/stat.c', 'ksu_handle_stat', [
+              (r'^SYSCALL_DEFINE4\(newfstatat,[^{]*\{', STAT, '\tksu_handle_stat(&dfd, &filename, &flag);\n', False, True),
+              (r'^SYSCALL_DEFINE4\(fstatat64,[^{]*\{', STAT, '\tksu_handle_stat(&dfd, &filename, &flag);\n', False, False)])
+
+          patch('kernel/reboot.c', 'ksu_handle_sys_reboot', [
+              (r'^SYSCALL_DEFINE4\(reboot,[^{]*\{', r'^[ \t]*if \(!ns_capable\(pid_ns->user_ns, CAP_SYS_BOOT\)\)',
+               '\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n', False, True)])
+
+          # --- read: injeksi rc init. Tanpa ini ksud tidak pernah jalan saat boot -> modul tidak pernah
+          #     dipindah dari modules_update ke modules, Zygisk tidak pernah aktif (root tetap jalan).
+          rw_text = rd('fs/read_write.c')
+          if use['read']:
+              if P['ksu_handle_sys_read'][2] == 1:
+                  body, xd = '\tksu_handle_sys_read(fd);\n', ''
+              elif has_var('ksu_vfs_read_hook'):
+                  body = '\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_sys_read(fd, &buf, &count);\n'
+                  xd = 'extern bool ksu_vfs_read_hook __read_mostly;\n'
+              else:
+                  body, xd = '\tksu_handle_sys_read(fd, &buf, &count);\n', ''
+              if re.search(r'^[ \t]*return ksys_read\(fd, buf, count\);', rw_text, re.M):
+                  anchor = r'^[ \t]*return ksys_read\(fd, buf, count\);'
+              elif re.search(r'^[ \t]*if \(f\.file\) \{', rw_text, re.M):
+                  anchor = r'^[ \t]*if \(f\.file\) \{'
+              else:
+                  die('fs/read_write.c: anchor SYSCALL_DEFINE3(read) tidak dikenal; hook read (init.rc) wajib')
+              patch('fs/read_write.c', 'ksu_handle_sys_read',
+                    [(r'^SYSCALL_DEFINE3\(read,[^{]*\{', anchor, body, False, True)], xd)
+          elif VFS in P:
+              if has_var('ksu_vfs_read_hook'):
+                  body = '\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n'
+                  xd = 'extern bool ksu_vfs_read_hook __read_mostly;\n'
+              else:
+                  body, xd = '\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n', ''
+              patch('fs/read_write.c', VFS, [
+                  (r'^ssize_t vfs_read\(struct file \*file, char __user \*buf, size_t count, loff_t \*pos\)[^{]*\{',
+                   r'^[ \t]*ret = rw_verify_area\(READ, file, pos, count\);', body, False, True)], xd)
+          else:
+              die('KernelSU-Next tidak punya ksu_handle_sys_read maupun ksu_handle_vfs_read: hook init.rc tidak bisa dipasang')
+
+          # --- newfstat: pasangan wajib dari hook read di atas. Init membaca init.rc hanya sebanyak st_size
+          #     dari fstat() (Android Canary 2601+). Tanpa hook ini rc injeksi (post-fs-data / services /
+          #     boot-completed) tidak pernah terbaca -> ksud tidak jalan saat boot normal, modules_update
+          #     tidak diproses, modul/Zygisk tidak aktif; soft reboot (ksud menjalankan ulang stage) normal.
+          if use['newfstat']:
+              patch('fs/stat.c', 'ksu_handle_newfstat_ret', [
+                  (r'^SYSCALL_DEFINE2\(newfstat,[^{]*\{', r'^[ \t]*return error;',
+                   '\tif (!error)\n\t\tksu_handle_newfstat_ret(&fd, &statbuf);\n', False, True)])
+          elif use['read']:
+              print('::warning::KernelSU-Next ini tidak punya ksu_handle_newfstat_ret: pada Android Canary 2601+ '
+                    'rc injeksi tidak akan terbaca init (modul tidak dimuat saat boot normal)')
+
+          # --- input: safe mode (opsional, hanya bila KernelSU-Next mendefinisikannya)
+          if use['input']:
+              if has_var('ksu_input_hook'):
+                  body = '\tif (unlikely(ksu_input_hook))\n\t\tksu_handle_input_handle_event(&type, &code, &value);\n'
+                  xd = 'extern bool ksu_input_hook __read_mostly;\n'
+              else:
+                  body, xd = '\tksu_handle_input_handle_event(&type, &code, &value);\n', ''
+              patch('drivers/input/input.c', 'ksu_handle_input_handle_event', [
+                  (r'^static void input_handle_event\([^{]*\{',
+                   r'^[^\n]*input_get_disposition\(dev, type, code, &value\);', body, True, True)], xd, required=False)
+
+          # ===================================================== 4. MANIFEST + cek pemanggilan di source
+          for path, sym in PATCHED:
+              ok = any(sym + '(' in l and not l.strip().startswith(('extern', '#', '//', '/*', '*'))
+                       for l in rd(path).split('\n'))
+              if not ok:
+                  die(f'{sym} tidak terpanggil di {path}')
+          MANIFEST.write_text('\n'.join(sorted({s for _, s in PATCHED})) + '\n')
+          print('[OK] hook terpasang:', ', '.join(f'{s}@{p}' for p, s in PATCHED))
           PYEOF
           cd "$KSRC"
-          python3 "$RUNNER_TEMP/ksu_hooks.py"
-          cat "$GITHUB_WORKSPACE/reports/hooks.env" >> "$GITHUB_ENV"
+          python3 "$RUNNER_TEMP/ksu_hooks.py" "$RUNNER_TEMP/hooks.list"
           echo "----- ringkasan hook -----"
-          git diff --stat -- fs kernel drivers/input security | tail -n 40
+          git diff --stat -- fs kernel drivers/input
+          git diff -U2 -- fs kernel drivers/input | sed -n '1,260p'
 
-      # ------------------------------------------------------------ add-on 2: NoMount
-      - name: Integrasi NoMount (built-in)
+      # ------------------------------------------------------------ add-on 3: NoMount
+      - name: Integrasi NoMount (built-in, Method 3 resmi)
         run: |
           cd "$KSRC"
           REF="$NOMOUNT_REF_IN"
           if [ "$REF" = "latest" ]; then
-            REF=$(gh api repos/maxsteeel/nomount/releases/latest --jq .tag_name 2>/dev/null || true)
-            [ -n "$REF" ] || { echo "::warning::gagal resolve release terbaru NoMount, pakai master"; REF=master; }
+            REF=$(gh api repos/maxsteeel/nomount/releases/latest --jq .tag_name)
+            [ -n "$REF" ] || { echo "::error::gagal resolve release terbaru NoMount"; exit 1; }
           fi
           echo "[i] NoMount ref: $REF"
           echo "NOMOUNT_REF=$REF" >> "$GITHUB_ENV"
 
           rm -rf fs/nomount
           sed -i '/nomount/d' fs/Kconfig fs/Makefile
-          OLD=$(grep -rIl 'nomount' fs include kernel --include='*.c' --include='*.h' 2>/dev/null | grep -v '^fs/nomount/' || true)
-          [ -z "$OLD" ] || echo "::warning::Sisa referensi 'nomount' di luar fs/nomount (hook NoMount lama?): $OLD"
+          git clone -q --depth 1 --branch "$REF" https://github.com/maxsteeel/nomount "$RUNNER_TEMP/nomount-src"
+          mkdir -p fs/nomount
+          cp -f "$RUNNER_TEMP"/nomount-src/kernel/src/* fs/nomount/
+          printf '\nsource "fs/nomount/Kconfig"\n' >> fs/Kconfig
+          printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
 
-          nm_ok() {
-            [ -f fs/nomount/Kconfig ] && [ -f fs/nomount/Makefile ] \
-              && ls fs/nomount/*.c >/dev/null 2>&1 \
-              && grep -q 'nomount/Kconfig' fs/Kconfig \
-              && grep -q 'nomount/' fs/Makefile \
-              && grep -q 'config NOMOUNT' fs/nomount/Kconfig
-          }
-
-          if curl -fsSL "https://raw.githubusercontent.com/maxsteeel/nomount/${REF}/kernel/setup.sh" \
-               -o "$RUNNER_TEMP/nomount_setup.sh" && bash "$RUNNER_TEMP/nomount_setup.sh" "$REF"; then
-            :
-          else
-            echo "::warning::setup.sh resmi NoMount gagal untuk ref '$REF'"
-          fi
-
-          if ! nm_ok; then
-            echo "[i] fallback integrasi manual (Method 3)"
-            rm -rf fs/nomount "$RUNNER_TEMP/nomount-src"
-            git clone --depth 1 --branch "$REF" https://github.com/maxsteeel/nomount "$RUNNER_TEMP/nomount-src"
-            mkdir -p fs/nomount
-            cp -f "$RUNNER_TEMP"/nomount-src/kernel/src/* fs/nomount/
-            sed -i '/nomount/d' fs/Kconfig fs/Makefile
-            printf '\nsource "fs/nomount/Kconfig"\n' >> fs/Kconfig
-            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
-          fi
-          nm_ok || { echo "::error::integrasi NoMount gagal"; ls -la fs/nomount || true; exit 1; }
-          [ "$(grep -c 'nomount/Kconfig' fs/Kconfig)" = "1" ] || { echo "::error::source NoMount ganda di fs/Kconfig"; exit 1; }
-          [ "$(grep -c 'nomount/' fs/Makefile)" = "1" ] || { echo "::error::obj NoMount ganda di fs/Makefile"; exit 1; }
-          echo "----- fs/nomount -----"
-          ls -la fs/nomount
-          cat fs/nomount/Kconfig
+          [ -f fs/nomount/Kconfig ] && ls fs/nomount/*.c >/dev/null 2>&1 && grep -q 'config NOMOUNT' fs/nomount/Kconfig \
+            || { echo "::error::integrasi NoMount gagal"; ls -la fs/nomount; exit 1; }
+          ls fs/nomount
 
       # ------------------------------------------------------------- path_umount backport
-      - name: Backport path_umount untuk kernel 4.19 (verifikasi ketat)
+      - name: Backport path_umount untuk kernel 4.19
         run: |
           cd "$KSRC"
           python3 - <<'PYEOF'
@@ -848,59 +604,58 @@ jobs:
           import sys
           from pathlib import Path
 
+
           def die(message):
               print(f"::error::{message}")
               sys.exit(1)
 
-          ns_path = Path("fs/namespace.c")
-          ih_path = Path("fs/internal.h")
+
+          ns_path, ih_path = Path("fs/namespace.c"), Path("fs/internal.h")
           if not ns_path.is_file() or not ih_path.is_file():
               die("fs/namespace.c atau fs/internal.h tidak ditemukan")
-
           src = ns_path.read_text()
 
-          def defined(name):
-              pattern = rf"(?m)^[ \t]*(?:static[ \t]+)?int[ \t]+{re.escape(name)}[ \t]*\([^;{{}}]*\)[ \t\r\n]*\{{"
-              return re.search(pattern, src) is not None
 
-          can_exists = defined("can_umount")
-          path_exists = defined("path_umount")
+          def pat(name):
+              return rf"(?m)^[ \t]*(?:static[ \t]+)?int[ \t]+{re.escape(name)}[ \t]*\([^;{{}}]*\)[ \t\r\n]*\{{"
+
+
+          can_exists = re.search(pat("can_umount"), src) is not None
+          path_exists = re.search(pat("path_umount"), src) is not None
           blocks = []
-
           if not can_exists:
               blocks.append(r'''static int can_umount(const struct path *path, int flags)
           {
-              struct mount *mnt = real_mount(path->mnt);
+          	struct mount *mnt = real_mount(path->mnt);
 
-              if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
-                  return -EINVAL;
-              if (!may_mount())
-                  return -EPERM;
-              if (path->dentry != path->mnt->mnt_root)
-                  return -EINVAL;
-              if (!check_mnt(mnt))
-                  return -EINVAL;
-              if (mnt->mnt.mnt_flags & MNT_LOCKED)
-                  return -EINVAL;
-              if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
-                  return -EPERM;
-              return 0;
+          	if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+          		return -EINVAL;
+          	if (!may_mount())
+          		return -EPERM;
+          	if (path->dentry != path->mnt->mnt_root)
+          		return -EINVAL;
+          	if (!check_mnt(mnt))
+          		return -EINVAL;
+          	if (mnt->mnt.mnt_flags & MNT_LOCKED)
+          		return -EINVAL;
+          	if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+          		return -EPERM;
+          	return 0;
           }''')
-
           if not path_exists:
               blocks.append(r'''int path_umount(struct path *path, int flags)
           {
-              struct mount *mnt = real_mount(path->mnt);
-              int ret;
+          	struct mount *mnt = real_mount(path->mnt);
+          	int ret;
 
-              ret = can_umount(path, flags);
-              if (!ret)
-                  ret = do_umount(mnt, flags);
+          	ret = can_umount(path, flags);
+          	if (!ret)
+          		ret = do_umount(mnt, flags);
 
-              /* Do not use path_put(): it would clear mnt_expiry_mark. */
-              dput(path->dentry);
-              mntput_no_expire(mnt);
-              return ret;
+          	/* Do not use path_put(): it would clear mnt_expiry_mark. */
+          	dput(path->dentry);
+          	mntput_no_expire(mnt);
+          	return ret;
           }''')
 
           if blocks:
@@ -909,65 +664,32 @@ jobs:
               else:
                   anchor = re.search(r"(?m)^static bool is_mnt_ns_file\s*\(", src)
               if anchor is None:
-                  die("anchor namespace.c tidak ditemukan; tidak akan menambal secara spekulatif")
-              patch = "\n\n" + "\n\n".join(blocks) + "\n\n"
-              src = src[:anchor.start()] + patch + src[anchor.start():]
+                  die("anchor namespace.c tidak ditemukan")
+              src = src[:anchor.start()] + "\n\n" + "\n\n".join(blocks) + "\n\n" + src[anchor.start():]
               ns_path.write_text(src)
-              print("[+] Backport path_umount diterapkan pada fs/namespace.c")
-          else:
-              print("[i] can_umount dan path_umount sudah memiliki definisi")
+              print("[+] backport path_umount diterapkan di fs/namespace.c")
 
           for name in ("can_umount", "path_umount"):
-              pattern = rf"(?m)^[ \t]*(?:static[ \t]+)?int[ \t]+{re.escape(name)}[ \t]*\([^;{{}}]*\)[ \t\r\n]*\{{"
-              count = len(re.findall(pattern, src))
-              if count != 1:
-                  die(f"definisi {name} harus tepat satu, ditemukan {count}")
+              n = len(re.findall(pat(name), src))
+              if n != 1:
+                  die(f"definisi {name} harus tepat satu, ditemukan {n}")
 
           header = ih_path.read_text()
-          prototype = r"(?m)^int[ \t]+path_umount\s*\(struct path \*path, int flags\);\s*$"
-          if not re.search(prototype, header):
-              h_anchor = re.search(r"(?m)^extern void __init mnt_init\(void\);\s*$", header)
-              if h_anchor is None:
-                  die("anchor deklarasi mnt_init di fs/internal.h tidak ditemukan")
-              end = h_anchor.end()
-              header = header[:end] + "\nint path_umount(struct path *path, int flags);" + header[end:]
+          proto = r"(?m)^int[ \t]+path_umount\s*\(struct path \*path, int flags\);\s*$"
+          if not re.search(proto, header):
+              h = re.search(r"(?m)^extern void __init mnt_init\(void\);\s*$", header)
+              if h is None:
+                  die("anchor mnt_init di fs/internal.h tidak ditemukan")
+              header = header[:h.end()] + "\nint path_umount(struct path *path, int flags);" + header[h.end():]
               ih_path.write_text(header)
-              print("[+] Prototype path_umount ditambahkan ke fs/internal.h")
-
-          if not re.search(prototype, ih_path.read_text()):
+          if not re.search(proto, ih_path.read_text()):
               die("prototype path_umount tidak terverifikasi")
-          print("[OK] Definisi path_umount unik")
+          print("[OK] path_umount: definisi unik, KernelSU-Next melewati backport otomatisnya")
           PYEOF
-
-      # ---------------------------------------------------------------- toolchain
-      - name: Pasang Neutron Clang
-        run: |
-          mkdir -p "$HOME/neutron"
-          cd "$HOME/neutron"
-          curl -fsSL https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman -o antman
-          chmod +x antman
-          if ! ./antman -S || [ ! -x bin/clang ]; then
-            echo "::warning::antman gagal, fallback ke release clang-build-catalogue"
-            URL=$(gh api repos/Neutron-Toolchains/clang-build-catalogue/releases/latest \
-                  --jq '[.assets[] | select(.name | endswith(".tar.zst"))][0].browser_download_url')
-            [ -n "$URL" ] || { echo "::error::tidak menemukan asset Neutron Clang"; exit 1; }
-            curl -fsSL "$URL" | tar --zstd -x
-          fi
-          [ -x bin/clang ] || { echo "::error::Neutron Clang tidak terpasang"; exit 1; }
-          export PATH="$HOME/neutron/bin:$PATH"
-          if ! clang --version >/dev/null 2>&1; then
-            echo "::warning::clang tidak bisa jalan, mencoba antman --patch=glibc"
-            ./antman --patch=glibc
-          fi
-          clang --version | sed -n '1p'
-          ld.lld --version | sed -n '1p'
-          command -v aarch64-linux-gnu-elfedit arm-linux-gnueabi-ld
-          echo "$HOME/neutron/bin" >> "$GITHUB_PATH"
 
       # ------------------------------------------------------------------- konfigurasi
       - name: Konfigurasi kernel
         run: |
-          export PATH="$HOME/neutron/bin:$PATH"
           cd "$KSRC"
           rm -rf out
           "$GITHUB_WORKSPACE/kmake.sh" "$DEF"
@@ -975,427 +697,135 @@ jobs:
           CFG=out/.config
           sc() { scripts/config --file "$CFG" "$@"; }
 
-          DEFINED=$(find "$KDIR" -type f \( -name 'Kconfig' -o -name 'Kconfig.*' \) -exec cat {} + \
-                    | sed -nE 's/^[[:space:]]*config[[:space:]]+([A-Z0-9_]+)[[:space:]]*$/\1/p' | sort -u)
-          has_sym() { printf '%s\n' "$DEFINED" | grep -qx "$1"; }
-          die() { echo "::error::$*"; exit 1; }
-
-          # --- SukiSU-Ultra builtin
-          has_sym KSU || die "simbol KSU tidak ada di Kconfig SukiSU (ref salah?)"
-          sc -e KSU
-          has_sym KSU_TAMPER_SYSCALL_TABLE && sc -d KSU_TAMPER_SYSCALL_TABLE
-          for s in KSU_KPROBES_KSUD KSU_DEBUG KSU_NOPRINTK KSU_SUSFS_SUS_SU; do
-            has_sym "$s" && sc -d "$s"
-          done
-
-          # --- KPM
-          if [ "$KPM" = "true" ]; then
-            has_sym KPM || die "CONFIG_KPM tidak ada di Kconfig SukiSU ref ini"
-            sc -e KPM
-          fi
-
-          # --- SUSFS: opsi Kconfig bawaan branch builtin (hanya simbol yang didefinisikan branch itu)
-          SUSFS_ON=""
-          if [ "${SUSFS_ACTIVE:-false}" = "true" ]; then
-            has_sym KSU_SUSFS || die "KSU_SUSFS tidak ada di Kconfig SukiSU branch ini"
-            for s in KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SPOOF_UNAME \
-                     KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP; do
-              if has_sym "$s"; then
-                sc -e "$s"
-                SUSFS_ON="$SUSFS_ON $s"
-              else
-                echo "::warning::$s tidak ada di Kconfig branch ini -> dilewati"
-              fi
-            done
-            has_sym KSU_SUSFS_ENABLE_LOG && sc -d KSU_SUSFS_ENABLE_LOG
-          else
-            has_sym KSU_SUSFS && sc -d KSU_SUSFS
-          fi
-
-          # --- NoMount + kebutuhan mount modul
-          sc -e KEYS -e NOMOUNT -e OVERLAY_FS -e TMPFS_XATTR -e TMPFS_POSIX_ACL
-
-          # --- baseline Zygisk / KPM: SELinux + KALLSYMS_ALL (dan dependensinya)
-          sc -e SECURITY -e SECURITY_SELINUX
-          sc -e DEBUG_KERNEL -e KALLSYMS -e KALLSYMS_ALL -e STACKTRACE
-
-          # --- nama kernel
-          sc --set-str LOCALVERSION "$LV"
-          sc -d LOCALVERSION_AUTO
+          # KernelSU-Next: manual hook, jalur kprobe mati (README fork)
+          sc -e KSU -e KSU_MANUAL_HOOK -d KSU_KPROBES_HOOK -d KSU_DEBUG
+          # SUSFS bawaan fork (README fork)
+          SUSFS="KSU_SUSFS KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP"
+          for s in $SUSFS; do sc -e "$s"; done
+          # NoMount (keyring = KEYS) + kebutuhan mount modul KSU; HIDE_SYMBOLS butuh KALLSYMS
+          sc -e KEYS -e NOMOUNT -e OVERLAY_FS -e TMPFS_XATTR -e TMPFS_POSIX_ACL -e KALLSYMS
+          # vdso32 butuh gcc arm32 (tidak dipasang; tidak diperlukan untuk Android 13+)
+          sc -d COMPAT_VDSO
+          # nama kernel
+          sc --set-str LOCALVERSION "$LV" -d LOCALVERSION_AUTO
 
           "$GITHUB_WORKSPACE/kmake.sh" olddefconfig
 
-          if grep -qx 'CONFIG_COMPAT_VDSO=y' "$CFG" && ! command -v arm-linux-gnueabi-gcc >/dev/null 2>&1; then
-            echo "::warning::CONFIG_COMPAT_VDSO=y tapi arm-linux-gnueabi-gcc tidak ada -> dimatikan"
-            sc -d COMPAT_VDSO
-            "$GITHUB_WORKSPACE/kmake.sh" olddefconfig
-          fi
-
           fail=0
-          need() { grep -qx "$1" "$CFG" || { echo "::error::$CFG tidak memuat $1 (dependency tidak terpenuhi?)"; fail=1; }; }
-          forbid() { if grep -qx "$1" "$CFG"; then echo "::error::$1 aktif padahal harus mati"; fail=1; fi; }
-          need CONFIG_KSU=y
-          need CONFIG_NOMOUNT=y
-          need CONFIG_KEYS=y
-          need CONFIG_OVERLAY_FS=y
-          need CONFIG_SECURITY=y
-          need CONFIG_SECURITY_SELINUX=y
-          need CONFIG_DEBUG_KERNEL=y
-          need CONFIG_KALLSYMS=y
-          need CONFIG_KALLSYMS_ALL=y
-          need CONFIG_STACKTRACE=y
-          [ "$KPM" != "true" ] || need CONFIG_KPM=y
-          for s in $SUSFS_ON; do need "CONFIG_${s}=y"; done
-          need "CONFIG_LOCALVERSION=\"$LV\""
-          forbid CONFIG_LOCALVERSION_AUTO=y
-          forbid CONFIG_KSU_KPROBES_KSUD=y
-          forbid CONFIG_KSU_SUSFS_SUS_SU=y
-          [ "${SUSFS_ACTIVE:-false}" = "true" ] || forbid CONFIG_KSU_SUSFS=y
-          forbid CONFIG_KSU_TAMPER_SYSCALL_TABLE=y
+          for c in KSU KSU_MANUAL_HOOK $SUSFS NOMOUNT KEYS OVERLAY_FS KALLSYMS; do
+            grep -qx "CONFIG_${c}=y" "$CFG" || { echo "::error::CONFIG_${c}=y tidak aktif di $CFG (dependency tidak terpenuhi?)"; fail=1; }
+          done
+          grep -qx 'CONFIG_KSU_KPROBES_HOOK=y' "$CFG" && { echo "::error::jalur kprobe KSU aktif (bentrok dgn manual hook)"; fail=1; }
+          grep -qx "CONFIG_LOCALVERSION=\"$LV\"" "$CFG" || { echo "::error::CONFIG_LOCALVERSION tidak sesuai"; fail=1; }
+          # syncconfig menyegarkan include/config/auto.conf (kalau tidak, kernelrelease membaca config lama)
+          "$GITHUB_WORKSPACE/kmake.sh" syncconfig
+          REL=$("$GITHUB_WORKSPACE/kmake.sh" -s kernelrelease 2>/dev/null | tail -n1 || true)
+          case "$REL" in
+            "$KERNEL_RELEASE") ;;
+            [0-9]*.[0-9]*.[0-9]*) echo "::error::kernelrelease='$REL', diminta '$KERNEL_RELEASE'"; fail=1 ;;
+            *) echo "::warning::kernelrelease tidak terbaca ('$REL'); nama final tetap dicek di banner vmlinux setelah build" ;;
+          esac
           if [ "$fail" != 0 ]; then
-            echo "::group::Kconfig SukiSU (untuk diagnosa dependency)"
-            find "$KDIR" -type f \( -name 'Kconfig' -o -name 'Kconfig.*' \) -exec cat {} +
+            echo "::group::Kconfig KernelSU-Next (diagnosa)"
+            find KernelSU-Next/kernel -type f \( -name 'Kconfig' -o -name 'Kconfig.*' \) -exec cat {} +
             echo "::endgroup::"
             exit 1
           fi
-          echo "----- ringkasan config -----"
-          grep -E '^(# )?CONFIG_(KSU|KPM|NOMOUNT|KEYS|OVERLAY_FS|SECURITY_SELINUX|DEBUG_KERNEL|STACKTRACE|KPROBES|KALLSYMS|LOCALVERSION|LTO|CC_STACKPROTECTOR)' "$CFG" || true
-
-      - name: Compat 4.19 - makro fallthrough + static_call (hanya jika kernel belum punya)
-        run: |
-          cd "$KSRC"
-          if grep -rqE '^[[:space:]]*#[[:space:]]*define[[:space:]]+fallthrough\b' include/linux include/uapi 2>/dev/null; then
-            echo "[=] makro fallthrough sudah ada di kernel"
-          else
-            cat >> include/linux/compiler.h <<'EOF'
-
-          /* LunarKnight CI: makro fallthrough (kernel < 5.4 belum punya; dipakai driver SukiSU) */
-          #ifndef fallthrough
-          # ifdef __has_attribute
-          #  if __has_attribute(__fallthrough__)
-          #   define fallthrough __attribute__((__fallthrough__))
-          #  endif
-          # endif
-          # ifndef fallthrough
-          #  define fallthrough do {} while (0)
-          # endif
-          #endif
-          EOF
-            echo "[+] makro fallthrough ditambahkan ke include/linux/compiler.h"
-          fi
-
-          # static_call: infrastruktur ini baru ada di kernel 5.10. Driver SukiSU builtin meng-include
-          # <linux/static_call.h> dari kernel_includes.h. Shim = fallback generic (pointer fungsi di dalam key),
-          # sama dengan implementasi upstream untuk arsitektur tanpa HAVE_STATIC_CALL.
-          if [ -f include/linux/static_call.h ]; then
-            echo "[=] include/linux/static_call.h sudah ada di kernel"
-          else
-            if [ ! -f include/linux/static_call_types.h ]; then
-              cat > include/linux/static_call_types.h <<'EOF'
-          /* SPDX-License-Identifier: GPL-2.0 */
-          /* LunarKnight CI: shim static_call_types.h untuk kernel < 5.10 (dipakai driver SukiSU builtin) */
-          #ifndef _STATIC_CALL_TYPES_H
-          #define _STATIC_CALL_TYPES_H
-
-          #include <linux/types.h>
-          #include <linux/stringify.h>
-          #include <linux/compiler.h>
-
-          #define __SC_PASTE2(a, b)		a##b
-          #define __SC_PASTE(a, b)		__SC_PASTE2(a, b)
-
-          #define STATIC_CALL_KEY_PREFIX		__SCK__
-          #define STATIC_CALL_KEY_PREFIX_STR	__stringify(STATIC_CALL_KEY_PREFIX)
-          #define STATIC_CALL_TRAMP_PREFIX	__SCT__
-          #define STATIC_CALL_TRAMP_PREFIX_STR	__stringify(STATIC_CALL_TRAMP_PREFIX)
-
-          #define STATIC_CALL_KEY(name)		__SC_PASTE(STATIC_CALL_KEY_PREFIX, name)
-          #define STATIC_CALL_TRAMP(name)		__SC_PASTE(STATIC_CALL_TRAMP_PREFIX, name)
-          #define STATIC_CALL_KEY_STR(name)	__stringify(STATIC_CALL_KEY(name))
-          #define STATIC_CALL_TRAMP_STR(name)	__stringify(STATIC_CALL_TRAMP(name))
-
-          struct static_call_key {
-          	void *func;
-          };
-
-          #define DECLARE_STATIC_CALL(name, func)					\
-          	extern struct static_call_key STATIC_CALL_KEY(name);		\
-          	extern typeof(func) STATIC_CALL_TRAMP(name);
-
-          #endif /* _STATIC_CALL_TYPES_H */
-          EOF
-              echo "[+] shim include/linux/static_call_types.h dibuat"
-            fi
-            cat > include/linux/static_call.h <<'EOF'
-          /* SPDX-License-Identifier: GPL-2.0 */
-          /* LunarKnight CI: shim static_call.h untuk kernel < 5.10 (dipakai driver SukiSU builtin).
-           * Fallback generic: pemanggilan = lompat lewat pointer di dalam key. NULL -> nop (seperti upstream). */
-          #ifndef _LINUX_STATIC_CALL_H
-          #define _LINUX_STATIC_CALL_H
-
-          #include <linux/types.h>
-          #include <linux/compiler.h>
-          #include <linux/export.h>
-          #include <linux/static_call_types.h>
-
-          static inline int static_call_init(void) { return 0; }
-          static inline void __static_call_nop(void) { }
-          static inline long __static_call_return0(void) { return 0; }
-
-          #define DEFINE_STATIC_CALL(name, _func)					\
-          	DECLARE_STATIC_CALL(name, _func)				\
-          	struct static_call_key STATIC_CALL_KEY(name) = {		\
-          		.func = (void *)(_func),				\
-          	}
-
-          #define DEFINE_STATIC_CALL_NULL(name, _func)				\
-          	DECLARE_STATIC_CALL(name, _func)				\
-          	struct static_call_key STATIC_CALL_KEY(name) = {		\
-          		.func = (void *)__static_call_nop,			\
-          	}
-
-          #define DEFINE_STATIC_CALL_RET0(name, _func)				\
-          	DECLARE_STATIC_CALL(name, _func)				\
-          	struct static_call_key STATIC_CALL_KEY(name) = {		\
-          		.func = (void *)__static_call_return0,			\
-          	}
-
-          #define __static_call(name)						\
-          	((typeof(STATIC_CALL_TRAMP(name)) *)READ_ONCE(STATIC_CALL_KEY(name).func))
-
-          #define static_call(name)	__static_call(name)
-          #define static_call_cond(name)	__static_call(name)
-          #define static_call_query(name)	(READ_ONCE(STATIC_CALL_KEY(name).func))
-
-          #define static_call_update(name, _fn)					\
-          ({									\
-          	typeof(&STATIC_CALL_TRAMP(name)) __F = (_fn);			\
-          	WRITE_ONCE(STATIC_CALL_KEY(name).func,				\
-          		   __F ? (void *)__F : (void *)__static_call_nop);	\
-          })
-
-          #define EXPORT_STATIC_CALL(name)	EXPORT_SYMBOL(STATIC_CALL_KEY(name))
-          #define EXPORT_STATIC_CALL_GPL(name)	EXPORT_SYMBOL_GPL(STATIC_CALL_KEY(name))
-          #define EXPORT_STATIC_CALL_TRAMP(name)
-          #define EXPORT_STATIC_CALL_TRAMP_GPL(name)
-
-          #endif /* _LINUX_STATIC_CALL_H */
-          EOF
-            echo "[+] shim include/linux/static_call.h dibuat (kernel < 5.10)"
-          fi
+          echo "[OK] config siap, kernelrelease = ${REL:-?}"
+          grep -E '^CONFIG_(KSU|NOMOUNT|KEYS|OVERLAY_FS|KALLSYMS|LOCALVERSION)' "$CFG"
 
       - name: Relax -Werror bawaan vendor
-        run: bash "$GITHUB_WORKSPACE/relax_werror.sh"
-
-      # Probe: kompilasi hanya drivers/kernelsu/ (beberapa menit) supaya kegagalan API/kompat ketahuan sebelum build penuh
-      - name: Kompilasi driver KSU lebih dulu (gagal cepat)
         run: |
-          export PATH="$HOME/neutron/bin:$PATH"
           cd "$KSRC"
-          LOG="$GITHUB_WORKSPACE/reports/ksu_driver.log"
-          mkdir -p "$GITHUB_WORKSPACE/reports"
-          # compile.h wajib ada sebelum driver KSU dikompilasi (lihat gen_compile_h.sh)
-          "$GITHUB_WORKSPACE/gen_compile_h.sh"
-          # -k: lanjut ke file lain setelah error pertama, jadi SEMUA error kompatibilitas driver terlihat dalam satu run.
-          # Objek hasilnya dipakai ulang oleh build penuh.
-          if ! "$GITHUB_WORKSPACE/kmake.sh" -k -j"$(nproc)" drivers/kernelsu/ > "$LOG" 2>&1 \
-             || ! find out/drivers/kernelsu -name '*.o' 2>/dev/null | grep -q .; then
-            echo "::group::Driver KSU gagal kompilasi - semua error"
-            grep -nE 'fatal error:|error:|undefined reference' "$LOG" | sed -n '1,80p' || true
-            echo "::endgroup::"
-            MISSING_H=$(grep -oE "fatal error: '[^']+' file not found" "$LOG" | sort -u || true)
-            [ -z "$MISSING_H" ] || { echo "::group::Header yang tidak ada di kernel ini"; echo "$MISSING_H"; echo "::endgroup::"; }
-            echo "::error::Driver SukiSU-Ultra@${KSU_REF} gagal kompilasi di kernel ini. Lihat reports/ksu_driver.log"
-            exit 1
-          fi
-
-          # SUSFS hanya dari builtin: fungsi susfs_* harus benar-benar didefinisikan oleh driver (sisi-kernel sudah dibuang)
-          if [ "${SUSFS_ACTIVE:-false}" = "true" ]; then
-            mapfile -t OBJS < <(find out/drivers/kernelsu -name '*.o' ! -name 'built-in.o' ! -name '*.mod.o')
-            SDEF=$(for o in "${OBJS[@]}"; do llvm-nm --defined-only "$o" 2>/dev/null; done \
-                     | awk 'NF{print $NF}' | grep -E '^susfs_' | sort -u || true)
-            SUND=$(for o in "${OBJS[@]}"; do llvm-nm --undefined-only "$o" 2>/dev/null; done \
-                     | awk 'NF{print $NF}' | grep -E '^susfs_' | sort -u || true)
-            SMISS=$(comm -23 <(printf '%s\n' "$SUND") <(printf '%s\n' "$SDEF") | grep -v '^$' || true)
-            {
-              echo "--- susfs_* terdefinisi di driver ($(printf '%s\n' "$SDEF" | grep -c . || true)) ---"
-              printf '%s\n' "$SDEF"
-              echo "--- susfs_* dipanggil tapi tidak terdefinisi ---"
-              printf '%s\n' "$SMISS"
-            } >> "$GITHUB_WORKSPACE/reports/susfs.log"
-            if [ -n "$SMISS" ]; then
-              echo "::error::Driver memanggil fungsi SUSFS yang tidak didefinisikan di mana pun: $(echo $SMISS | tr '\n' ' '). Branch builtin ini tidak membawa implementasi SUSFS sisi-kernel; jalankan ulang dengan susfs=false."
-              exit 1
-            fi
-            if [ -z "$SDEF" ]; then
-              echo "::error::Tidak ada fungsi susfs_* yang terkompilasi di driver meski CONFIG_KSU_SUSFS=y: SUSFS builtin tidak aktif di ref ini. Jalankan ulang dengan susfs=false atau pakai ref lain."
-              exit 1
-            fi
-            echo "[OK] SUSFS builtin: $(printf '%s\n' "$SDEF" | grep -c .) fungsi susfs_* terdefinisi di driver"
-            if grep -q 'You have not integrated susfs' "$LOG"; then
-              echo "::notice::Kbuild SukiSU mencetak 'not integrated susfs' (hanya cek fs/susfs.c); diabaikan karena implementasi SUSFS ada di driver builtin"
-            fi
-          fi
-          echo "[OK] driver SukiSU-Ultra@${KSU_REF} terkompilasi di kernel ini"
-
-      - name: Gerbang nama kernel (utsrelease.h harus persis sama)
-        run: |
-          export PATH="$HOME/neutron/bin:$PATH"
-          cd "$KSRC"
-          "$GITHUB_WORKSPACE/kmake.sh" include/generated/utsrelease.h > "$RUNNER_TEMP/uts.log" 2>&1 \
-            || { cat "$RUNNER_TEMP/uts.log"; echo "::error::gagal membuat utsrelease.h dengan release '$REL'"; exit 1; }
-          GOT=$(sed -nE 's/^#define UTS_RELEASE "(.*)"$/\1/p' out/include/generated/utsrelease.h)
-          echo "[i] UTS_RELEASE = $GOT"
-          [ "$GOT" = "$REL" ] || { echo "::error::UTS_RELEASE '$GOT' != '$REL'"; exit 1; }
-          [ "$(cat out/include/config/kernel.release)" = "$REL" ] \
-            || { echo "::error::kernel.release '$(cat out/include/config/kernel.release)' != '$REL'"; exit 1; }
-          echo "[OK] nama kernel: $REL"
+          find drivers techpack fs net sound security kernel mm lib block crypto arch/arm64 KernelSU-Next/kernel \
+            -type f \( -name Makefile -o -name Kbuild -o -name 'Makefile.*' \) 2>/dev/null \
+            -exec sed -E -i 's/(^|[[:space:]])-Werror([[:space:]]|$)/\1\2/g' {} +
 
       # ------------------------------------------------------------------------ build
       - name: Build kernel
         run: |
-          export PATH="$HOME/neutron/bin:$PATH"
           cd "$KSRC"
-          [ -s out/include/generated/compile.h ] || "$GITHUB_WORKSPACE/gen_compile_h.sh"
           set +e
           "$GITHUB_WORKSPACE/kmake.sh" -j"$(nproc)" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
           rc=${PIPESTATUS[0]}
           set -e
+          if [ "$rc" -ne 0 ] && grep -q "incomplete type 'struct stack_trace'" "$GITHUB_WORKSPACE/build.log"; then
+            # driver vendor memakai struct stack_trace, hanya ada kalau CONFIG_STACKTRACE=y
+            echo "::notice::struct stack_trace butuh CONFIG_STACKTRACE, diaktifkan lalu build dilanjutkan"
+            scripts/config --file out/.config -e STACKTRACE
+            "$GITHUB_WORKSPACE/kmake.sh" olddefconfig
+            set +e
+            "$GITHUB_WORKSPACE/kmake.sh" -j"$(nproc)" 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+            rc=${PIPESTATUS[0]}
+            set -e
+          fi
           if [ "$rc" -ne 0 ]; then
             echo "::error::Build gagal (rc=$rc)"
-            echo "::group::Ringkasan error"
             grep -nE 'error:|Error [0-9]+|undefined reference|ld(\.lld)?: error' "$GITHUB_WORKSPACE/build.log" | sed -n '1,60p' || true
-            echo "::endgroup::"
-            echo "::group::Re-run -j1 (error pertama yang bersih)"
-            "$GITHUB_WORKSPACE/kmake.sh" -j1 2>&1 | tail -n 80 || true
-            echo "::endgroup::"
             exit 1
           fi
           ls -la out/arch/arm64/boot
 
-      - name: Verifikasi baseline KSU / Zygisk / KPM
+      - name: Verifikasi binary (hook benar-benar terpanggil)
         run: |
-          set -euo pipefail
           cd "$KSRC"
-          # Zygisk Next mendokumentasikan minimum KernelSU kernel 10940
-          KSU_CODE=$(grep -aoE -- '-- .*(KernelSU|SukiSU)[A-Za-z -]*[Vv]ersion: *[0-9]+' "$GITHUB_WORKSPACE/build.log" | tail -n1 | grep -oE '[0-9]+$' || true)
-          if [ -z "$KSU_CODE" ]; then
-            echo "::warning::versi kernel-side SukiSU tidak terbaca dari build.log (format Kbuild berbeda); gerbang minimum Zygisk Next (10940) dilewati"
-            KSU_CODE="?"
-          else
-            echo "[i] kernel-side SukiSU version code: $KSU_CODE"
-            [ "$KSU_CODE" -ge 10940 ] || { echo "::error::versi $KSU_CODE di bawah minimum Zygisk Next 10940"; exit 1; }
-          fi
-          for c in CONFIG_SECURITY=y CONFIG_SECURITY_SELINUX=y CONFIG_DEBUG_KERNEL=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y CONFIG_STACKTRACE=y; do
-            grep -qx "$c" out/.config || { echo "::error::$c wajib (Zygisk/KPM)"; exit 1; }
-          done
-          if [ "$KPM" = "true" ]; then
-            grep -qx 'CONFIG_KPM=y' out/.config || { echo "::error::CONFIG_KPM=y tidak aktif"; exit 1; }
-          fi
-          if [ "${SUSFS_ACTIVE:-false}" = "true" ]; then
-            SV=$(grep -aoE -- '-- SUSFS_VERSION: *v?[0-9][0-9.]*' "$GITHUB_WORKSPACE/build.log" | tail -n1 | grep -oE '[0-9][0-9.]*$' || true)
-            if [ -z "$SV" ]; then
-              echo "[i] baris '-- SUSFS_VERSION' tidak ada di build.log (Kbuild hanya mencetaknya bila fs/susfs.c ada); versi dari header builtin: ${SUSFS_NUM:-?}"
-            else
-              echo "[i] SUSFS_VERSION: v$SV"
-              echo "SUSFS_NUM=$SV" >> "$GITHUB_ENV"
-            fi
-          fi
-          grep -aE -- '-- (KERNEL_TYPE|KERNEL_VERSION|KPM)' "$GITHUB_WORKSPACE/build.log" | sort -u | sed -n '1,8p' || true
-          REL_BUILT=$(cat out/include/config/kernel.release)
-          [ "$REL_BUILT" = "$REL" ] || { echo "::error::kernel.release '$REL_BUILT' != '$REL'"; exit 1; }
-          grep -aqF "Linux version $REL" out/arch/arm64/boot/Image \
-            || { echo "::error::string 'Linux version $REL' tidak ada di Image"; exit 1; }
-          echo "KSU_DRIVER_CODE=$KSU_CODE" >> "$GITHUB_ENV"
-          echo "[OK] baseline tervalidasi; Image memuat 'Linux version $REL'"
-
-      - name: Verifikasi simbol hasil build
-        run: |
-          export PATH="$HOME/neutron/bin:$PATH"
-          cd "$KSRC"
-          llvm-nm out/vmlinux > "$RUNNER_TEMP/syms.txt"
           fail=0
-          NEED="path_umount ksu_handle_execveat ksu_handle_faccessat ksu_handle_stat ksu_handle_sys_reboot"
-          [ "${HOOK_NEWFSTAT:-false}" != "true" ] || NEED="$NEED ksu_handle_newfstat_ret"
-          for s in $NEED; do
-            grep -qw "$s" "$RUNNER_TEMP/syms.txt" || { echo "::error::simbol $s tidak ada di vmlinux"; fail=1; }
-          done
-          find out/fs/nomount -name '*.o' 2>/dev/null | grep -q . || { echo "::error::objek NoMount tidak terkompilasi"; fail=1; }
-          grep -qi 'nomount' "$RUNNER_TEMP/syms.txt" || { echo "::error::simbol NoMount tidak ada di vmlinux"; fail=1; }
-          if [ "${SUSFS_ACTIVE:-false}" = "true" ]; then
-            grep -qE ' [A-Za-z] susfs_' "$RUNNER_TEMP/syms.txt" || { echo "::error::fungsi susfs_* tidak ada di vmlinux (SUSFS builtin tidak ter-link)"; fail=1; }
-          fi
-          if [ "$KPM" = "true" ]; then
-            if grep -qi 'kpm' "$RUNNER_TEMP/syms.txt"; then
-              echo "[OK] simbol KPM ada di vmlinux: $(grep -ci 'kpm' "$RUNNER_TEMP/syms.txt") simbol"
-            else
-              echo "::warning::CONFIG_KPM=y tapi tidak ada simbol kpm di vmlinux (loader KPM kemungkinan stub di ref SukiSU ini). Uji dengan demo-hello.kpm setelah boot."
-            fi
-          fi
-          [ "$fail" = 0 ] || exit 1
-          echo "[OK] semua komponen ter-link di vmlinux"
-          grep -E ' (ksu_handle_|susfs_)' "$RUNNER_TEMP/syms.txt" | sed -n '1,40p' || true
+          # 1. nama + author di banner kernel
+          BANNER="Linux version ${KERNEL_RELEASE} (${KBUILD_BUILD_USER}@${KBUILD_BUILD_HOST})"
+          strings -a out/vmlinux > "$RUNNER_TEMP/strings.txt"
+          grep -qF "$BANNER" "$RUNNER_TEMP/strings.txt" || { echo "::error::banner kernel tidak memuat '$BANNER'"; fail=1; }
 
-      # --------------------------------------------------------------------- KPM patch
-      - name: Patch Image dengan KernelPatch (patch_linux) - opsional, gagal = lanjut tanpa patch
-        if: ${{ inputs.kpm && inputs.kpm_patch }}
-        run: |
-          BOOT="$KSRC/out/arch/arm64/boot"
-          W="$RUNNER_TEMP/kpm"
-          rm -rf "$W"; mkdir -p "$W"
-          skip() { echo "::warning::$*"; echo "KPM_PATCHED=false" >> "$GITHUB_ENV"; exit 0; }
-          [ -f "$BOOT/Image" ] && [ -f "$BOOT/Image.gz" ] && [ -f "$BOOT/Image.gz-dtb" ] \
-            || skip "Image / Image.gz / Image.gz-dtb mentah tidak lengkap, patch KPM dilewati"
-          cp "$BOOT/Image" "$W/Image"
-          URL=$(gh api repos/ShirkNeko/SukiSU_KernelPatch_patch/releases/latest \
-                  --jq '[.assets[] | select(.name=="patch_linux")][0].browser_download_url' 2>/dev/null || true)
-          if [ -z "$URL" ] || [ "$URL" = "null" ]; then
-            URL="https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU_patch/refs/heads/main/kpm/patch_linux"
-          fi
-          echo "[i] patch_linux: $URL"
-          curl -fsSL "$URL" -o "$W/patch_linux" || skip "gagal mengunduh patch_linux"
-          chmod +x "$W/patch_linux"
-          cd "$W"
-          ./patch_linux > patch.log 2>&1 || { cat patch.log; skip "patch_linux gagal"; }
-          cat patch.log | tail -n 20
-          [ -s oImage ] || skip "oImage tidak dihasilkan"
-          A=$(stat -c %s Image); B=$(stat -c %s oImage)
-          echo "[i] Image=$A oImage=$B"
-          [ "$B" -ge "$A" ] && [ "$B" -le $((A + 8000000)) ] || skip "ukuran oImage ($B) tidak wajar vs Image ($A)"
-          GZS=$(stat -c %s "$BOOT/Image.gz")
-          cmp -s -n "$GZS" "$BOOT/Image.gz-dtb" "$BOOT/Image.gz" || skip "Image.gz-dtb bukan 'Image.gz + dtb', tidak bisa dirakit ulang dengan aman"
-          tail -c +$((GZS + 1)) "$BOOT/Image.gz-dtb" > dtbs.bin
-          [ -s dtbs.bin ] || skip "payload dtb kosong"
-          gzip -n -9 -c oImage > Image.gz.kpm
-          cat Image.gz.kpm dtbs.bin > Image.gz-dtb.kpm
-          echo "KPM_PATCHED=true" >> "$GITHUB_ENV"
-          echo "KPM_IMG=$W/Image.gz-dtb.kpm" >> "$GITHUB_ENV"
-          echo "[OK] Image ter-patch KPM: $(stat -c %s Image.gz-dtb.kpm) bytes"
+          # 2. setiap hook punya pemanggil di luar KSU/SUSFS (hook yang tidak terpanggil = modul tidak pernah
+          #    di-apply, Zygisk tidak jalan, root tetap jalan)
+          cat > "$RUNNER_TEMP/callers.awk" <<'EOF'
+          BEGIN { n = split(list, want, " "); for (i = 1; i <= n; i++) w[want[i]] = 1 }
+          /^[0-9a-f]+ <.+>:$/ { fn = $2; sub(/^</, "", fn); sub(/>:$/, "", fn); next }
+          /[ \t](bl|b)[ \t]/ {
+            if (match($0, /<[A-Za-z0-9_.$]+(\+0x[0-9a-f]+)?>$/)) {
+              t = substr($0, RSTART + 1, RLENGTH - 2); sub(/\+0x[0-9a-f]+$/, "", t)
+              if ((t in w) && fn !~ /^(ksu_|susfs)/) c[t] = c[t] " " fn
+            }
+          }
+          END { for (s in w) printf "%s\t%s\n", s, ((s in c) ? c[s] : "") }
+          EOF
+          llvm-objdump -d --no-show-raw-insn out/vmlinux \
+            | awk -v list="$(tr '\n' ' ' < "$RUNNER_TEMP/hooks.list")" -f "$RUNNER_TEMP/callers.awk" \
+            | sort > "$RUNNER_TEMP/callers.txt"
+          echo "----- pemanggil hook di vmlinux -----"
+          cat "$RUNNER_TEMP/callers.txt"
+          while IFS=$'\t' read -r sym callers; do
+            [ -n "${callers// /}" ] || { echo "::error::$sym tidak punya pemanggil di vmlinux (hook tidak aktif)"; fail=1; }
+          done < "$RUNNER_TEMP/callers.txt"
+
+          # 3. objek KSU / NoMount / SUSFS ter-link
+          llvm-nm out/vmlinux > "$RUNNER_TEMP/syms.txt"
+          [ -n "$(find out/drivers/kernelsu -name '*.o' -print -quit)" ] || { echo "::error::objek KernelSU tidak terkompilasi"; fail=1; }
+          [ -n "$(find out/fs/nomount -name '*.o' -print -quit)" ] || { echo "::error::objek NoMount tidak terkompilasi"; fail=1; }
+          grep -qi 'susfs' "$RUNNER_TEMP/syms.txt" || { echo "::error::simbol susfs tidak ada di vmlinux"; fail=1; }
+          grep -qi 'nomount' "$RUNNER_TEMP/syms.txt" || { echo "::error::simbol nomount tidak ada di vmlinux"; fail=1; }
+          grep -qw path_umount "$RUNNER_TEMP/syms.txt" || { echo "::error::path_umount tidak ada di vmlinux"; fail=1; }
+          [ "$fail" = 0 ] || exit 1
+          echo "[OK] KernelSU-Next + SUSFS + NoMount ter-link, semua hook terpanggil, banner sesuai"
 
       # --------------------------------------------------------------------- packaging
       - name: Package AnyKernel3
         run: |
           cd "$GITHUB_WORKSPACE"
-          git clone --depth 1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          git clone -q --depth 1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
           cd AnyKernel3
-          grep -q '^split_boot()' tools/ak3-core.sh && grep -q '^flash_boot()' tools/ak3-core.sh \
-            || { echo "::error::AnyKernel3 terbaru tidak punya split_boot/flash_boot, sesuaikan anykernel.sh"; exit 1; }
           rm -rf .git .github README.md
 
           cat > anykernel.sh <<'EOF'
           #!/sbin/sh
           # AnyKernel3 - LunarKnight / Xiaomi Redmi Note 5 Pro (whyred)
           properties() { '
-          kernel.string=@KNAME@ by Shirakumo@Github
+          kernel.string=@REL@ by Shirakumo@Github
           do.devicecheck=1
-          do.modules=0
-          do.systemless=0
           do.cleanup=1
-          do.cleanuponabort=0
           device.name1=whyred
           '; } # end properties
 
-          # whyred: non A/B, kernel Image.gz-dtb (appended DTB), partisi boot
+          # whyred: non A/B, Image.gz-dtb (DTB menempel), partisi boot
           BLOCK=/dev/block/bootdevice/by-name/boot;
           IS_SLOT_DEVICE=0;
           RAMDISK_COMPRESSION=auto;
@@ -1404,66 +834,34 @@ jobs:
           . tools/ak3-core.sh;
 
           ui_print " ";
-          ui_print "@KNAME@";
+          ui_print "@REL@ (whyred)";
+          ui_print "KernelSU-Next legacy-susfs + NoMount";
           ui_print "by Shirakumo@Github";
-          ui_print "SukiSU Ultra (builtin) + @SUSFS@ + NoMount + @KPM@";
-          ui_print " ";
 
           split_boot;
           flash_boot;
-
-          ui_print " ";
-          ui_print "Selesai. Reboot, lalu pakai manager SukiSU Ultra yang cocok dengan kernel ini.";
           EOF
-          SUSFS_TXT="tanpa SUSFS"
-          [ "${SUSFS_ACTIVE:-false}" != "true" ] || SUSFS_TXT="SUSFS builtin${SUSFS_NUM:+ v$SUSFS_NUM}"
-          KPM_TXT="tanpa KPM"
-          [ "$KPM" != "true" ] || KPM_TXT="KPM"
-          sed -i "s|@KNAME@|${KNAME}|g; s|@SUSFS@|${SUSFS_TXT}|g; s|@KPM@|${KPM_TXT}|g" anykernel.sh
-          grep -n 'kernel.string' anykernel.sh
+          sed -i "s#@REL@#${KERNEL_RELEASE}#g" anykernel.sh
 
           BOOT="$KSRC/out/arch/arm64/boot"
           if [ -f "$BOOT/Image.gz-dtb" ]; then
-            cp "$BOOT/Image.gz-dtb" "$RUNNER_TEMP/Image.gz-dtb.plain"
-          elif [ -f "$BOOT/Image.gz" ]; then
+            cp "$BOOT/Image.gz-dtb" Image.gz-dtb
+          else
             echo "::warning::Image.gz-dtb tidak ada, merakit Image.gz + dtb"
             mapfile -t DTBS < <(find "$BOOT/dts" -name '*whyred*.dtb' | sort)
-            [ "${#DTBS[@]}" -gt 0 ] || mapfile -t DTBS < <(find "$BOOT/dts" -name '*sdm636*.dtb' | sort)
             [ "${#DTBS[@]}" -gt 0 ] || { echo "::error::DTB whyred tidak ditemukan"; ls -R "$BOOT" | sed -n '1,60p'; exit 1; }
-            cat "$BOOT/Image.gz" "${DTBS[@]}" > "$RUNNER_TEMP/Image.gz-dtb.plain"
-          else
-            echo "::error::tidak ada Image.gz-dtb / Image.gz di $BOOT"; ls -la "$BOOT"; exit 1
+            cat "$BOOT/Image.gz" "${DTBS[@]}" > Image.gz-dtb
           fi
-          SZ=$(stat -c %s "$RUNNER_TEMP/Image.gz-dtb.plain")
+          SZ=$(stat -c %s Image.gz-dtb)
+          [ "$SZ" -gt 4000000 ] || { echo "::error::Image.gz-dtb terlalu kecil ($SZ bytes)"; exit 1; }
           echo "[i] Image.gz-dtb = $SZ bytes"
-          [ "$SZ" -gt 4000000 ] || { echo "::error::Image.gz-dtb terlalu kecil ($SZ bytes), build tidak wajar"; exit 1; }
 
           STAMP=$(TZ=Asia/Jakarta date +%Y%m%d-%H%M)
-          TAG="LunarKnight-whyred-${KBASE}-st20-SukiSU"
-          [ "${SUSFS_ACTIVE:-false}" != "true" ] || TAG="${TAG}-susfs${SUSFS_NUM}"
-          TAG="${TAG}-NoMount"
-          [ "$KPM" != "true" ] || TAG="${TAG}-KPM"
-
-          mkzip() {
-            local img="$1" zip="$2"
-            cp "$img" Image.gz-dtb
-            rm -f "$GITHUB_WORKSPACE/$zip"
-            zip -r9 "$GITHUB_WORKSPACE/$zip" . -x '*.git*' -x 'Image.gz-dtb.*' > /dev/null
-            unzip -l "$GITHUB_WORKSPACE/$zip" | grep -E 'anykernel.sh|Image.gz-dtb|update-binary'
-          }
-          if [ "${KPM_PATCHED:-false}" = "true" ]; then
-            ZIP_MAIN="${TAG}-patched-${STAMP}-${KSHA}.zip"
-            ZIP_ALT="${TAG}-unpatched-fallback-${STAMP}-${KSHA}.zip"
-            mkzip "$KPM_IMG" "$ZIP_MAIN"
-            mkzip "$RUNNER_TEMP/Image.gz-dtb.plain" "$ZIP_ALT"
-          else
-            ZIP_MAIN="${TAG}-${STAMP}-${KSHA}.zip"
-            ZIP_ALT=""
-            mkzip "$RUNNER_TEMP/Image.gz-dtb.plain" "$ZIP_MAIN"
-          fi
+          ZIP="LunarKnight-whyred-${KERNEL_RELEASE}-KSUN-SUSFS-NoMount-${STAMP}-${KSHA}.zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP" . -x '*.git*' > /dev/null
+          unzip -l "$GITHUB_WORKSPACE/$ZIP" | grep -E 'anykernel.sh|Image.gz-dtb|update-binary'
           {
-            echo "ZIP=$ZIP_MAIN"
-            echo "ZIP_ALT=$ZIP_ALT"
+            echo "ZIP=$ZIP"
             echo "STAMP=$STAMP"
           } >> "$GITHUB_ENV"
           cp "$KSRC/out/.config" "$GITHUB_WORKSPACE/kernel.config"
@@ -1472,11 +870,11 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: LunarKnight-whyred-${{ env.STAMP }}
-          path: ${{ github.workspace }}/LunarKnight-whyred-*.zip
+          path: ${{ github.workspace }}/${{ env.ZIP }}
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload log, config & laporan integrasi
+      - name: Upload log & config
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -1484,7 +882,6 @@ jobs:
           path: |
             ${{ github.workspace }}/build.log
             ${{ github.workspace }}/kernel.config
-            ${{ github.workspace }}/reports/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -1492,24 +889,18 @@ jobs:
         if: success()
         run: |
           {
-            echo "### LunarKnight whyred — ${REL}"
-            echo "- Kernel: \`${KERNEL_REPO}@${KERNEL_REF}\` (${KSHA}), defconfig \`${DEF}\`"
-            echo "- SukiSU-Ultra: \`SukiSU-Ultra/SukiSU-Ultra@${KSU_REF}\` (${KSU_SHA}), hook manual"
-            echo "- SUSFS: ${SUSFS_ACTIVE:-false} ${SUSFS_NUM:+(v$SUSFS_NUM)} | hook newfstat_ret: ${HOOK_NEWFSTAT:-false}"
+            echo "### ${KERNEL_RELEASE} (Shirakumo@Github)"
+            echo "- Kernel: \`${{ inputs.kernel_repo }}@${{ inputs.kernel_ref }}\` (${KSHA})"
+            echo "- KernelSU-Next legacy-susfs: \`${KSUN_SHA}\`, manual hooks, SUSFS bawaan fork"
             echo "- NoMount: \`${NOMOUNT_REF}\` (built-in)"
-            echo "- KPM: CONFIG_KPM=${KPM}, Image ter-patch: ${KPM_PATCHED:-false}"
-            echo "- Zygisk: KALLSYMS_ALL=y, SELinux=y, kernel-side KSU code ${KSU_DRIVER_CODE} (Zygisk Next min 10940)"
-            echo "- Zip utama: \`${ZIP}\`"
-            [ -z "${ZIP_ALT}" ] || echo "- Zip cadangan (tanpa patch KPM): \`${ZIP_ALT}\`"
-            echo
-            echo "Setelah boot: manager SukiSU harus versi yang cocok dengan kernel; uji KPM dengan demo-hello.kpm."
+            echo "- Zip: \`${ZIP}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Release (opsional)
         if: ${{ inputs.release }}
         run: |
           cd "$GITHUB_WORKSPACE"
-          gh release create "whyred-${STAMP}" LunarKnight-whyred-*.zip \
+          gh release create "whyred-${STAMP}" "$ZIP" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "LunarKnight whyred ${KBASE} (${STAMP})" \
-            --notes "Release ${REL} | ${KERNEL_REPO}@${KERNEL_REF} @ ${KSHA} | SukiSU-Ultra ${KSU_REF} @ ${KSU_SHA} | SUSFS ${SUSFS_ACTIVE:-false} ${SUSFS_NUM:+v$SUSFS_NUM }| NoMount ${NOMOUNT_REF} | KPM ${KPM} (patched: ${KPM_PATCHED:-false}) | Neutron Clang"
+            --title "${KERNEL_RELEASE} (${STAMP})" \
+            --notes "Kernel ${KVER} @ ${KSHA} | KernelSU-Next legacy-susfs @ ${KSUN_SHA} (manual hooks) | NoMount ${NOMOUNT_REF} (built-in) | Neutron Clang | by Shirakumo@Github"
