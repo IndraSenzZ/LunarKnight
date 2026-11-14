@@ -1013,11 +1013,15 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	curr->sum_exec_runtime += delta_exec;
 	schedstat_add(cfs_rq->exec_clock, delta_exec);
 
-#ifdef CONFIG_SCHED_EEVDF
-	curr->vruntime += calc_delta_fair(delta_exec, curr);
-	update_deadline(cfs_rq, curr);
-#else
+	/*
+	 * BORE, when built in, adds a burst penalty on top of nice by
+	 * charging extra vruntime. That is the only penalty: weight, PELT,
+	 * schedtune and uclamp are left alone. EEVDF sees the same charge
+	 * and expires the virtual deadline sooner.
+	 */
 	curr->vruntime += calc_delta_fair_bore(delta_exec, curr);
+#ifdef CONFIG_SCHED_EEVDF
+	update_deadline(cfs_rq, curr);
 #endif
 	update_min_vruntime(cfs_rq);
 
@@ -3081,10 +3085,17 @@ static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			update_curr(cfs_rq);
 #ifdef CONFIG_SCHED_EEVDF
 		{
-			u64 avruntime = avg_vruntime(cfs_rq);
+			u64 avruntime;
 
+			/*
+			 * se must not be part of the average it is reweighted
+			 * against. Non-current entities are removed from the
+			 * tree first; current is not in the stored sum and
+			 * avg_vruntime_skip() does not add it back.
+			 */
 			if (cfs_rq->curr != se)
 				__dequeue_entity(cfs_rq, se);
+			avruntime = avg_vruntime_skip(cfs_rq, se, false);
 			reweight_eevdf(se, avruntime, weight);
 		}
 #endif
@@ -4074,13 +4085,8 @@ static inline unsigned long uclamp_task_util(struct task_struct *p)
 #ifdef CONFIG_SCHED_CASS
 static inline unsigned long cass_task_util(struct task_struct *p)
 {
-	unsigned long util = task_util_est(p);
-
-#ifdef CONFIG_UCLAMP_TASK
-	if (uclamp_is_used())
-		util = max(util, (unsigned long)uclamp_eff_value(p, UCLAMP_MIN));
-#endif
-	return util;
+	/* Wakeup uses this same hybrid: stune margin, then uclamp. */
+	return uclamp_task_util(p);
 }
 
 static inline bool cass_task_fits_cpu(struct task_struct *p, int cpu)
@@ -4241,11 +4247,12 @@ static inline bool cpu_is_in_target_set(struct task_struct *p, int cpu)
 {
 	struct root_domain *rd = cpu_rq(cpu)->rd;
 	int first_cpu, next_usable_cpu;
-#ifdef CONFIG_SCHED_TUNE
-	if (schedtune_prefer_high_cap(p)) {
-#else
-	if (uclamp_boosted(p)) {
-#endif
+	/*
+	 * schedtune prefer-big, uclamp min and the per-task boost are
+	 * independent signals. CONFIG_SCHED_TUNE must not hide uclamp.
+	 */
+	if (schedtune_prefer_high_cap(p) || uclamp_boosted(p) ||
+	    per_task_boost(p) > TASK_BOOST_NONE) {
 		first_cpu = rd->mid_cap_orig_cpu != -1 ? rd->mid_cap_orig_cpu :
 			    rd->max_cap_orig_cpu;
 
@@ -4654,8 +4661,27 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	enqueue_runnable_load_avg(cfs_rq, se);
 	account_entity_enqueue(cfs_rq, se);
 
+#ifdef CONFIG_SCHED_EEVDF
+	/*
+	 * vruntime/deadline are absolute on THIS cfs_rq. Fork, migration,
+	 * cgroup move and wakeup only carry lag, so every off-rq enqueue
+	 * re-places. Current keeps the key it already has: placing it
+	 * would count it twice in the average. A never-run entity that is
+	 * not a wakeup gets the short initial slice.
+	 *
+	 * account_entity_enqueue() has already added this entity to
+	 * nr_running and cfs_rq->load. sched_slice() adds them again
+	 * while on_rq is clear, so the slice is one task too small.
+	 */
+	if (!curr) {
+		se->on_rq = 1;
+		place_entity(cfs_rq, se,
+			     !se->sum_exec_runtime && !(flags & ENQUEUE_WAKEUP));
+	}
+#else
 	if (flags & ENQUEUE_WAKEUP)
 		place_entity(cfs_rq, se, 0);
+#endif
 	/* Entity has migrated, no longer consider this task hot */
 	if (flags & ENQUEUE_MIGRATED)
 		se->exec_start = 0;
@@ -4836,9 +4862,6 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 		update_stats_wait_end(cfs_rq, se);
 		__dequeue_entity(cfs_rq, se);
 		update_load_avg(cfs_rq, se, UPDATE_TG);
-#ifdef CONFIG_SCHED_EEVDF
-		se->vlag = se->deadline;
-#endif
 	}
 
 	update_stats_curr_start(cfs_rq, se);
@@ -5854,8 +5877,13 @@ static unsigned long capacity_of(int cpu);
 bool __cpu_overutilized(int cpu, int delta)
 {
 #ifdef CONFIG_SCHED_CASS
+	/*
+	 * Same ~20% headroom as cass_fits_cap(). Wakeup "does not fit" and
+	 * load-balance "overutilized" have to use one margin or tasks sit
+	 * on a CPU that refuses new work and also refuses to migrate.
+	 */
 	return !fits_capacity((cpu_util(cpu) + delta), cass_cpu_fit_cap(cpu),
-			      sched_capacity_margin_up[cpu]);
+			      CASS_FIT_MARGIN);
 #else
 	return !fits_capacity((cpu_util(cpu) + delta), capacity_orig_of(cpu),
 			      sched_capacity_margin_up[cpu]);
@@ -5922,8 +5950,9 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	struct cfs_rq *cfs_rq;
 	struct sched_entity *se = &p->se;
         int idle_h_nr_running = task_has_idle_policy(p);
-	bool prefer_idle = sched_feat(EAS_PREFER_IDLE) ?
-				(schedtune_prefer_idle(p) > 0) : 0;
+	bool prefer_idle = sched_feat(EAS_PREFER_IDLE) &&
+			   (schedtune_prefer_idle(p) ||
+			    uclamp_latency_sensitive(p));
 	int task_new = !(flags & ENQUEUE_WAKEUP);
 
 
@@ -7490,14 +7519,20 @@ static int get_start_cpu(struct task_struct *p, bool sync_boost)
 	struct root_domain *rd = cpu_rq(smp_processor_id())->rd;
 	int start_cpu = rd->min_cap_orig_cpu;
 	int task_boost = per_task_boost(p);
-#ifdef CONFIG_SCHED_TUNE
+	/*
+	 * prefer-big from schedtune, and a uclamp.min that cannot fit
+	 * the small cluster. Any min above 0 is not prefer-big: that
+	 * would pin background clamps to Gold.
+	 */
 	bool boosted = (schedtune_prefer_high_cap(p) &&
-				    p->prio <= DEFAULT_PRIO) ||
-#else
-	bool boosted = uclamp_boosted(p) ||
+			p->prio <= DEFAULT_PRIO) ||
+#ifdef CONFIG_UCLAMP_TASK
+		       (uclamp_is_used() &&
+			uclamp_eff_value(p, UCLAMP_MIN) >
+				(SCHED_CAPACITY_SCALE / 2)) ||
 #endif
-			task_boost_policy(p) == SCHED_BOOST_ON_BIG ||
-			task_boost == TASK_BOOST_ON_MID;
+		       task_boost_policy(p) == SCHED_BOOST_ON_BIG ||
+		       task_boost == TASK_BOOST_ON_MID;
 	bool task_skip_min = task_skip_min_cpu(p);
 
 	/*
@@ -7778,7 +7813,7 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 				 * Skip searching for active CPU for tasks have
 				 * prefer_high_cap.
 				 */
-				if (schedtune_prefer_high_cap(p))
+				if (prefer_high_cap)
 					continue;
 				/*
 				 * Case A.2: Target ACTIVE CPU
@@ -7992,11 +8027,8 @@ static void find_best_target(struct sched_domain *sd, cpumask_t *cpus,
 	if (target_cpu != -1 && !idle_cpu(target_cpu) &&
 			best_idle_cpu != -1) {
 		curr_tsk = READ_ONCE(cpu_rq(target_cpu)->curr);
-#ifdef CONFIG_SCHED_TUNE
-		if (curr_tsk && schedtune_prefer_high_cap(curr_tsk))
-#else
-		if (curr_tsk && uclamp_boosted(curr_tsk))
-#endif
+		if (curr_tsk && (schedtune_prefer_high_cap(curr_tsk) ||
+				 uclamp_boosted(curr_tsk)))
 			target_cpu = best_idle_cpu;
 	}
 
@@ -8211,12 +8243,10 @@ static void select_cpu_candidates(struct sched_domain *sd, cpumask_t *cpus,
 {
 	int highest_spare_cap_cpu = prev_cpu, best_idle_cpu = -1;
 	unsigned long spare_cap, max_spare_cap, util, cpu_cap;
-	bool prefer_idle = uclamp_latency_sensitive(p);
-#ifdef CONFIG_SCHED_TUNE
-	bool prefer_high_cap = schedtune_prefer_high_cap(p);
-#else
-	bool prefer_high_cap = uclamp_boosted(p);
-#endif
+	bool prefer_idle = uclamp_latency_sensitive(p) ||
+			   schedtune_prefer_idle(p);
+	bool prefer_high_cap = schedtune_prefer_high_cap(p) ||
+			       uclamp_boosted(p);
 	unsigned long target_cap = prefer_high_cap ? 0 : ULONG_MAX;
 	unsigned long highest_spare_cap = 0;
 	unsigned int min_exit_lat = UINT_MAX;
@@ -8381,11 +8411,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
 	int delta = 0;
 	int task_boost = per_task_boost(p);
 	int boosted = (uclamp_boosted(p) > 0) || (task_boost > 0);
-#ifdef CONFIG_SCHED_TUNE
-	bool prefer_high_cap = schedtune_prefer_high_cap(p);
-#else
-	bool prefer_high_cap = boosted;
-#endif
+	bool prefer_high_cap = schedtune_prefer_high_cap(p) || boosted;
 	int start_cpu = get_start_cpu(p, sync_boost);
 
 	if (is_many_wakeup(sibling_count_hint) && prev_cpu != cpu &&
@@ -8871,7 +8897,12 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	update_curr(cfs_rq_of(se));
 	BUG_ON(!pse);
 #ifdef CONFIG_SCHED_EEVDF
-	if (pick_eevdf(cfs_rq_of(se)) == pse) {
+	/*
+	 * Wakeup does not honor RUN_TO_PARITY. Otherwise an interactive
+	 * task waits out the rest of the current slice, which with hrtick
+	 * off means it waits for the next tick.
+	 */
+	if (__pick_eevdf(cfs_rq_of(se), false) == pse) {
 		if (!next_buddy_marked)
 			set_next_buddy(pse);
 		goto preempt;
@@ -9104,7 +9135,29 @@ static void yield_task_fair(struct rq *rq)
 	}
 	restart_burst_bore(curr);
 
+#ifdef CONFIG_SCHED_EEVDF
+	/*
+	 * pick_eevdf() ignores the skip buddy, so sched_yield() ran until
+	 * the tick. Charge this task first, then push its deadline one
+	 * extra virtual slice behind peers. rq_clock_skip_update stops
+	 * put_prev_entity() from calling update_deadline() and handing
+	 * the slice straight back.
+	 */
+	update_rq_clock(rq);
+	update_curr(cfs_rq);
+	rq_clock_skip_update(rq);
+	{
+		u64 vslice = calc_delta_fair(se->slice ? se->slice :
+					     sysctl_sched_min_granularity, se);
+
+		if ((s64)(se->deadline - se->vruntime) < (s64)vslice)
+			se->deadline = se->vruntime + vslice;
+		se->deadline += vslice;
+	}
+	resched_curr(rq);
+#else
 	set_skip_buddy(se);
+#endif
 }
 
 static bool yield_to_task_fair(struct rq *rq, struct task_struct *p, bool preempt)
@@ -11324,13 +11377,6 @@ static int should_we_balance(struct lb_env *env)
 		return 0;
 
 	/*
-	 * Ensure the balancing environment is consistent; can happen
-	 * when the softirq triggers 'during' hotplug.
-	 */
-	if (!cpumask_test_cpu(env->dst_cpu, env->cpus))
-		return 0;
-
-	/*
 	 * In the newly idle case, we will allow all the CPUs
 	 * to do the newly idle load balance.
 	 *
@@ -12849,10 +12895,34 @@ static void task_fork_fair(struct task_struct *p)
 
 	cfs_rq = task_cfs_rq(current);
 	curr = cfs_rq->curr;
-	if (curr) {
+	if (curr)
 		update_curr(cfs_rq);
-		se->vruntime = curr->vruntime;
+
+#ifdef CONFIG_SCHED_EEVDF
+	/*
+	 * Placed again from lag at enqueue, on the CPU the child actually
+	 * lands on. A deadline taken from the parent's cfs_rq is on the
+	 * wrong timeline as soon as fork-balance moves the child.
+	 */
+	se->vruntime = cfs_rq->min_vruntime;
+	se->vlag = 0;
+	se->deadline = 0;
+	se->slice = 0;
+	if (sysctl_sched_child_runs_first && curr) {
+		/*
+		 * Larger than one slice, so RUN_TO_PARITY does not keep
+		 * the parent through the rest of its virtual deadline.
+		 * Default of the sysctl is 0; this only runs when set.
+		 */
+		if (se->load.weight)
+			se->vlag = (s64)calc_delta_fair(sysctl_sched_latency, se);
+		else
+			se->vlag = (s64)sysctl_sched_latency;
+		resched_curr(rq);
 	}
+#else
+	if (curr)
+		se->vruntime = curr->vruntime;
 	place_entity(cfs_rq, se, 1);
 
 	if (sysctl_sched_child_runs_first && curr && entity_before(curr, se)) {
@@ -12865,6 +12935,7 @@ static void task_fork_fair(struct task_struct *p)
 	}
 
 	se->vruntime -= cfs_rq->min_vruntime;
+#endif
 	rq_unlock(rq, &rf);
 }
 

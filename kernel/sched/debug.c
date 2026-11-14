@@ -410,8 +410,18 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 			SPLIT_NS(cfs_rq->exec_clock));
 
 	raw_spin_lock_irqsave(&rq->lock, flags);
-	if (rb_first_cached(&cfs_rq->tasks_timeline))
+	if (rb_first_cached(&cfs_rq->tasks_timeline)) {
+#ifdef CONFIG_SCHED_EEVDF
+		struct rb_node *root = cfs_rq->tasks_timeline.rb_root.rb_node;
+
+		/* Leftmost is the earliest deadline, not min vruntime. */
+		if (root)
+			MIN_vruntime = rb_entry(root, struct sched_entity,
+						run_node)->min_vruntime;
+#else
 		MIN_vruntime = (__pick_first_entity(cfs_rq))->vruntime;
+#endif
+	}
 	last = __pick_last_entity(cfs_rq);
 	if (last)
 		max_vruntime = last->vruntime;

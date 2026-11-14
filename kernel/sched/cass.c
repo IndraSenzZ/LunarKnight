@@ -84,39 +84,67 @@ static __always_inline
 void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 {
 	struct rq *rq = cpu_rq(c->cpu);
-	struct cfs_rq *cfs_rq = &rq->cfs;
-	unsigned long est;
 
-	c->util = READ_ONCE(cfs_rq->avg.util_avg);
-	if (sched_feat(UTIL_EST)) {
-		est = READ_ONCE(cfs_rq->avg.util_est.enqueued);
-		if (est > c->util) {
-			sync = false;
-			c->util = est;
+#ifdef CONFIG_SCHED_WALT
+	c->util = READ_ONCE(rq->walt_stats.cumulative_runnable_avg_scaled);
+#else
+	{
+		struct cfs_rq *cfs_rq = &rq->cfs;
+
+		c->util = READ_ONCE(cfs_rq->avg.util_avg);
+		if (sched_feat(UTIL_EST)) {
+			unsigned long est = READ_ONCE(cfs_rq->avg.util_est.enqueued);
+
+			if (est > c->util) {
+				sync = false;
+				c->util = est;
+			}
 		}
 	}
+#endif
 
-	if (sync && c->cpu == this_cpu && !rt_task(current))
-		c->util -= min(c->util, task_util(current));
+	if (sync && c->cpu == this_cpu && !rt_task(current)) {
+		unsigned long wake_util = task_util(current);
+
+#ifndef CONFIG_SCHED_WALT
+		if (sched_feat(UTIL_EST))
+			wake_util = max(wake_util, _task_util_est(current));
+#endif
+		c->util -= min(c->util, wake_util);
+	}
 
 	c->hard_util = cpu_util_rt(rq) + cpu_util_dl(rq) + cpu_util_irq(rq);
 	c->cap = c->cap_max - min(c->hard_util, c->cap_max - 1);
 	c->cap_no_therm = c->cap_orig - min(c->hard_util, c->cap_orig - 1);
 }
 
+/* Unique highest-capacity CPU only. A symmetric Gold pair (SDM660)
+ * has no prime, so background is not steered onto the last cpu id.
+ */
+static bool cass_is_prime_cpu(int cpu)
+{
+	unsigned long cap = cass_cap_orig(cpu);
+	int o;
+
+	for_each_possible_cpu(o) {
+		if (o == cpu)
+			continue;
+		if (cass_cap_orig(o) >= cap)
+			return false;
+	}
+	return true;
+}
+
 static __always_inline
 bool cass_prime_cpu(const struct cass_cpu_cand *c)
 {
-	if (nr_cpu_ids < 2)
-		return false;
-
-	return c->cpu == nr_cpu_ids - 1 &&
-	       cass_cap_orig(nr_cpu_ids - 2) != SCHED_CAPACITY_SCALE;
+	return cass_is_prime_cpu(c->cpu);
 }
 
 static __always_inline bool cass_prefer_idle(struct task_struct *p)
 {
-	return wake_to_idle(p) || schedtune_prefer_idle(p);
+	return wake_to_idle(p) || schedtune_prefer_idle(p) ||
+	       uclamp_latency_sensitive(p);
 }
 
 static DEFINE_SPINLOCK(cass_boost_lock);
@@ -125,6 +153,11 @@ static __always_inline bool cass_prefer_high_cap(struct task_struct *p)
 {
 	if (cass_boosted())
 		return true;
+#ifdef CONFIG_SCHED_WALT
+	if (sched_boost() == FULL_THROTTLE_BOOST ||
+	    sched_boost() == CONSERVATIVE_BOOST)
+		return true;
+#endif
 	if (schedtune_prefer_high_cap(p))
 		return true;
 	return per_task_boost(p) > TASK_BOOST_NONE;
@@ -139,7 +172,7 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 {
 #define cass_cmp(a, b) ({ res = (long)(a) - (long)(b); })
 #define cass_eq(a, b) ({ res = (a) == (b); })
-	long res;
+	long res = 0;
 
 	/* uclamp.max: a CPU that fits the clamp beats one that does not.
 	 * Before relative util so background stays on Silver even if Gold
@@ -246,9 +279,10 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync,
 	bool prefer_idle, prefer_high_cap;
 	int cidx = 0, cpu;
 
-	p_util = task_util_est(p);
+	/* Same hybrid number as schedutil: stune margin, then uclamp. */
+	p_util = uclamp_task_util(p);
 	if (is_fork)
-		p_util = max(p_util, task_util_est(current));
+		p_util = max(p_util, uclamp_task_util(current));
 	uc_min = cass_uclamp_min(p);
 	uc_max = cass_uclamp_max(p);
 	prefer_idle = cass_prefer_idle(p);
@@ -360,6 +394,7 @@ static int cass_select_task_rq_fair(struct task_struct *p, int prev_cpu,
 	return cass_select_task_rq(p, prev_cpu, sd_flag, wake_flags);
 }
 
+#ifndef CONFIG_SCHED_WALT
 int sched_set_boost(int type)
 {
 	unsigned long flags;
@@ -420,6 +455,31 @@ static int __init cass_sysctl_init(void)
 }
 late_initcall(cass_sysctl_init);
 #endif
+
+/*
+ * WALT's boost.c is not linked. Keep the symbol sysctl tables already
+ * call so a WALT-off build still links, and route it at the CASS boost.
+ */
+int sched_boost_handler(struct ctl_table *table, int write,
+			void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret, old;
+
+	if (!table || !table->data)
+		return -EINVAL;
+
+	old = *(int *)table->data;
+	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+	if (ret || !write)
+		return ret;
+
+	ret = sched_set_boost(*(int *)table->data);
+	if (ret)
+		*(int *)table->data = old;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(sched_boost_handler);
+#endif /* !CONFIG_SCHED_WALT */
 
 static bool cass_can_migrate_task(struct task_struct *p, int src_cpu,
 				  int dst_cpu)

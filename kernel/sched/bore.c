@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Burst-Oriented Response Enhancer — CFS vruntime scoring.
- * Scoring from firelzrd BORE 6.8; applied as vruntime only on 4.19 CFS.
+ * Burst-Oriented Response Enhancer.
+ * Scoring from firelzrd BORE. Applied as extra vruntime in
+ * calc_delta_fair_bore(), for both CFS and EEVDF. Task weight is not
+ * rewritten, so nice, PELT, schedtune and uclamp stay intact.
  */
 #include "sched.h"
 
