@@ -12,6 +12,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "sched.h"
+#include <linux/sched/boost_src.h>
 
 #include <linux/sched/cpufreq.h>
 #include <trace/events/power.h>
@@ -310,11 +311,6 @@ unsigned long schedhorizon_cpu_util(int cpu, unsigned long util_cfs,
 	unsigned long dl_util, util, irq;
 	struct rq *rq = cpu_rq(cpu);
 
-	if (sched_feat(SUGOV_RT_MAX_FREQ) && !IS_BUILTIN(CONFIG_UCLAMP_TASK) &&
-	    type == FREQUENCY_UTIL && rt_rq_is_runnable(&rq->rt)) {
-		return max;
-	}
-
 	/*
 	 * Early check to see if IRQ/steal time saturates the CPU, can be
 	 * because of inaccuracies in how we track these -- see
@@ -337,12 +333,20 @@ unsigned long schedhorizon_cpu_util(int cpu, unsigned long util_cfs,
 	 * frequency will be gracefully reduced with the utilization decay.
 	 */
 	util = util_cfs + cpu_util_rt(rq);
-	if (type == FREQUENCY_UTIL)
+	if (type == FREQUENCY_UTIL) {
 #ifdef CONFIG_SCHED_TUNE
-		util += schedtune_cpu_margin_with(util, cpu, p);
-#else
-		util = uclamp_rq_util_with(rq, util, p);
+		if (sched_boost_stune())
+			util += schedtune_cpu_margin_with(util, cpu, p);
 #endif
+		if (sched_boost_uclamp())
+			util = uclamp_rq_util_with(rq, util, p);
+		/*
+		 * Do not pin a shared cluster policy at fmax just because
+		 * one CPU is running RT. Half of max matches schedutil.
+		 */
+		if (sched_feat(SUGOV_RT_MAX_FREQ) && rt_rq_is_runnable(&rq->rt))
+			util = max(util, max >> 1);
+	}
 	
 	dl_util = cpu_util_dl(rq);
 
