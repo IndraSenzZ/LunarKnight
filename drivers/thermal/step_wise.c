@@ -28,23 +28,12 @@
 #include "thermal_core.h"
 
 /*
- * If the temperature is higher than a trip point,
- *    a. if the trend is THERMAL_TREND_RAISING, use higher cooling
- *       state for this trip point
- *    b. if the trend is THERMAL_TREND_DROPPING, do nothing
- *    c. if the trend is THERMAL_TREND_RAISE_FULL, use upper limit
- *       for this trip point
- *    d. if the trend is THERMAL_TREND_DROP_FULL, use lower limit
- *       for this trip point
- * If the temperature is lower than a trip point,
- *    a. if the trend is THERMAL_TREND_RAISING, do nothing
- *    b. if the trend is THERMAL_TREND_DROPPING, use lower cooling
- *       state for this trip point, if the cooling state already
- *       equals lower limit, deactivate the thermal instance
- *    c. if the trend is THERMAL_TREND_RAISE_FULL, do nothing
- *    d. if the trend is THERMAL_TREND_DROP_FULL, use lower limit,
- *       if the cooling state already equals lower limit,
- *       deactivate the thermal instance
+ * Above the trip: step the cooling device up, or jump to the trip's
+ * upper/lower limit for the FULL trends. Below the hysteresis the
+ * instance is dropped in one shot. TSENS delivers a single falling-edge
+ * interrupt and does not poll, so walking cur_state - 1 leaves a device
+ * that climbed two steps (gold thermal-cpufreq-4) stuck above idle
+ * until reboot. Little only climbs one step, so the same edge hits 0.
  */
 static unsigned long get_target_state(struct thermal_instance *instance,
 				enum thermal_trend trend, bool throttle)
@@ -53,66 +42,38 @@ static unsigned long get_target_state(struct thermal_instance *instance,
 	unsigned long cur_state;
 	unsigned long next_target;
 
-	/*
-	 * If the throttle condition is not reached and there is no
-	 * previous mitigaiton request, then there is nothing to compute.
-	 */
-	if (!throttle && instance->target == THERMAL_NO_TARGET)
+	/* Below hysteresis: release this trip completely. */
+	if (!throttle)
 		return THERMAL_NO_TARGET;
-	/*
-	 * We keep this instance the way it is by default.
-	 * Otherwise, we use the current state of the
-	 * cdev in use to determine the next_target.
-	 */
+
 	cdev->ops->get_cur_state(cdev, &cur_state);
 	next_target = instance->target;
 	dev_dbg(&cdev->device, "cur_state=%ld\n", cur_state);
 
 	if (!instance->initialized) {
-		if (throttle) {
-			next_target = (cur_state + 1) >= instance->upper ?
-					instance->upper :
-					((cur_state + 1) < instance->lower ?
-					instance->lower : (cur_state + 1));
-		} else {
-			next_target = THERMAL_NO_TARGET;
-		}
-
+		next_target = (cur_state + 1) >= instance->upper ?
+				instance->upper :
+				((cur_state + 1) < instance->lower ?
+				instance->lower : (cur_state + 1));
 		return next_target;
 	}
 
 	switch (trend) {
 	case THERMAL_TREND_RAISING:
-		if (throttle) {
-			next_target = cur_state < instance->upper ?
-				    (cur_state + 1) : instance->upper;
-			if (next_target < instance->lower)
-				next_target = instance->lower;
-		}
+		next_target = cur_state < instance->upper ?
+			    (cur_state + 1) : instance->upper;
+		if (next_target < instance->lower)
+			next_target = instance->lower;
 		break;
 	case THERMAL_TREND_RAISE_FULL:
-		if (throttle)
-			next_target = instance->upper;
+		next_target = instance->upper;
 		break;
 	case THERMAL_TREND_DROPPING:
 	case THERMAL_TREND_STABLE:
-		if (cur_state <= instance->lower ||
-			instance->target <= instance->lower) {
-			if (!throttle)
-				next_target = THERMAL_NO_TARGET;
-		} else {
-			if (!throttle) {
-				next_target = cur_state - 1;
-				if (next_target > instance->upper)
-					next_target = instance->upper;
-			}
-		}
+		/* Still above hysteresis: hold this step. */
 		break;
 	case THERMAL_TREND_DROP_FULL:
-		if (cur_state == instance->lower) {
-			if (!throttle)
-				next_target = THERMAL_NO_TARGET;
-		} else
+		if (cur_state != instance->lower)
 			next_target = instance->lower;
 		break;
 	default:

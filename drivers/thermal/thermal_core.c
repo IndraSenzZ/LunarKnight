@@ -514,6 +514,13 @@ void thermal_zone_device_update_temp(struct thermal_zone_device *tz,
 
 	for (count = 0; count < tz->trips; count++)
 		handle_thermal_trip(tz, count);
+
+	/*
+	 * Sensor IRQs land here, not in thermal_zone_device_update().
+	 * Without this the passive delay never arms, so a zone whose
+	 * DT actually polls cannot walk its cooling state after the edge.
+	 */
+	monitor_thermal_zone(tz);
 }
 EXPORT_SYMBOL(thermal_zone_device_update_temp);
 
